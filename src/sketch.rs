@@ -779,6 +779,7 @@ pub fn sketch_genome(
     ref_file: &str,
     min_spacing: usize,
     pseudotax: bool,
+    sylph_faithful: bool,
 ) -> Result<GenomeSketch> {
     let reader = parse_fastx_file(ref_file)
         .with_context(|| format!("Failed to parse genome file: {}", ref_file))?;
@@ -796,29 +797,43 @@ pub fn sketch_genome(
         min_spacing,
         genome_kmers: Vec::new(),
     };
-    
+
     let mut contig_number = 0;
-    
+
     while let Some(record) = reader.next() {
         let record = record.with_context(|| "Failed to read genome record")?;
-        
+
         if first {
             let contig_name = String::from_utf8_lossy(record.id()).to_string();
             return_genome_sketch.first_contig_name = contig_name;
             first = false;
         }
-        
+
         let seq = record.seq();
         return_genome_sketch.gn_size += seq.len();
         extract_kmers_positions(&seq, &mut vec, c, k, contig_number);
         contig_number += 1;
     }
-    
-    let mut kmer_set = FxHashSet::default();
-    let mut duplicate_set = FxHashSet::default();
+
     let mut new_vec = Vec::with_capacity(vec.len());
     vec.sort();
-    
+
+    if sylph_faithful {
+        // sylph semantics: sort + dedup — a k-mer repeated in the genome keeps a
+        // single copy instead of being deleted outright. No min-spacing filter is
+        // applied (--sylph-faithful forces min_spacing = 0 upstream).
+        let mut seen = FxHashSet::default();
+        for (_, _, km) in vec.iter() {
+            if seen.insert(*km) {
+                new_vec.push(*km);
+            }
+        }
+        return_genome_sketch.genome_kmers = new_vec;
+        return Ok(return_genome_sketch);
+    }
+
+    let mut kmer_set = FxHashSet::default();
+    let mut duplicate_set = FxHashSet::default();
     for (_, _, km) in vec.iter() {
         if !kmer_set.contains(km) {
             kmer_set.insert(*km);
@@ -852,6 +867,7 @@ pub fn sketch_genome_individual(
     ref_file: &str,
     min_spacing: usize,
     pseudotax: bool,
+    sylph_faithful: bool,
 ) -> Result<Vec<GenomeSketch>> {
     let reader = parse_fastx_file(ref_file)
         .with_context(|| format!("Failed to parse genome file: {}", ref_file))?;
@@ -877,27 +893,37 @@ pub fn sketch_genome_individual(
 
         extract_kmers_positions(&seq, &mut kmer_vec, c, k, 0);
 
-        let mut kmer_set = FxHashSet::default();
-        let mut duplicate_set = FxHashSet::default();
         let mut new_vec = Vec::with_capacity(kmer_vec.len());
         kmer_vec.sort();
-        
-        for (_, _pos, km) in kmer_vec.iter() {
-            if !kmer_set.contains(km) {
-                kmer_set.insert(*km);
-            } else {
-                duplicate_set.insert(*km);
-            }
-        }
-        
-        let mut last_pos = 0;
-        for (_, pos, km) in kmer_vec.iter() {
-            if !duplicate_set.contains(km) {
-                if last_pos == 0 || pos - last_pos > min_spacing {
+
+        if sylph_faithful {
+            // sylph semantics: sort + dedup — repeated k-mers keep one copy.
+            let mut seen = FxHashSet::default();
+            for (_, _, km) in kmer_vec.iter() {
+                if seen.insert(*km) {
                     new_vec.push(*km);
-                    last_pos = *pos;
-                } else if pseudotax {
-                    pseudotax_track_kmers.push(*km);
+                }
+            }
+        } else {
+            let mut kmer_set = FxHashSet::default();
+            let mut duplicate_set = FxHashSet::default();
+            for (_, _pos, km) in kmer_vec.iter() {
+                if !kmer_set.contains(km) {
+                    kmer_set.insert(*km);
+                } else {
+                    duplicate_set.insert(*km);
+                }
+            }
+
+            let mut last_pos = 0;
+            for (_, pos, km) in kmer_vec.iter() {
+                if !duplicate_set.contains(km) {
+                    if last_pos == 0 || pos - last_pos > min_spacing {
+                        new_vec.push(*km);
+                        last_pos = *pos;
+                    } else if pseudotax {
+                        pseudotax_track_kmers.push(*km);
+                    }
                 }
             }
         }
@@ -1060,6 +1086,23 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
     let mut first_pairs = vec![];
     let mut second_pairs = vec![];
 
+    // --sylph-faithful forces min_spacing = 0 (sylph applies no spacing filter);
+    // an explicit non-zero --min-spacing conflicts with that and is rejected.
+    let min_spacing_kmer = if args.sylph_faithful {
+        match args.min_spacing_kmer {
+            None | Some(0) => 0,
+            Some(n) => {
+                return Err(anyhow!(
+                    "--sylph-faithful forces --min-spacing 0 (sylph applies no spacing filter); \
+                     got an explicit --min-spacing {}. Drop --min-spacing to proceed.",
+                    n
+                ));
+            }
+        }
+    } else {
+        args.min_spacing_kmer.unwrap_or(30)
+    };
+
     check_args_valid(&args)?;
     parse_ambiguous_files(&args, &mut read_inputs, &mut genome_inputs)?;
     parse_reads_and_genomes(&args, &mut read_inputs, &mut genome_inputs)?;
@@ -1208,57 +1251,73 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
                     args.c,
                     args.k,
                     genome_file,
-                    args.min_spacing_kmer,
+                    min_spacing_kmer,
                     !args.no_pseudotax,
+                    args.sylph_faithful,
                 )?;
-                
+
                 // 设置 genome_id 到每个 sketch
                 for sketch in &mut indiv_gn_sketches {
                     sketch.file_name = genome_id.clone();
                 }
-                
+
                 // 生成单个基因组文件的子文件
                 for (j, sketch) in indiv_gn_sketches.iter().enumerate() {
-                    let individual_path = output_dir.join(format!("{}_{}{}", genome_id, j, QUERY_FILE_SUFFIX));
-                    
-                    let mut individual_file = BufWriter::new(
-                        File::create(&individual_path)
-                            .with_context(|| format!("Failed to create individual genome file: {}", individual_path.display()))?
-                    );
+                    let individual_path =
+                        output_dir.join(format!("{}_{}{}", genome_id, j, QUERY_FILE_SUFFIX));
+
+                    let mut individual_file =
+                        BufWriter::new(File::create(&individual_path).with_context(|| {
+                            format!(
+                                "Failed to create individual genome file: {}",
+                                individual_path.display()
+                            )
+                        })?);
                     bincode::serialize_into(&mut individual_file, &vec![sketch.clone()])
                         .with_context(|| "Failed to serialize individual genome sketch")?;
-                    info!("Individual genome sketch {} complete.", individual_path.display());
+                    info!(
+                        "Individual genome sketch {} complete.",
+                        individual_path.display()
+                    );
                 }
             } else {
                 let mut genome_sketch = sketch_genome(
                     args.c,
                     args.k,
                     genome_file,
-                    args.min_spacing_kmer,
+                    min_spacing_kmer,
                     !args.no_pseudotax,
+                    args.sylph_faithful,
                 )?;
-                
+
                 // 设置 genome_id
                 genome_sketch.file_name = genome_id.clone();
-                
+
                 // 生成单个基因组文件的子文件
-                let individual_path = output_dir.join(format!("{}{}", genome_id, QUERY_FILE_SUFFIX));
-                
-                let mut individual_file = BufWriter::new(
-                    File::create(&individual_path)
-                        .with_context(|| format!("Failed to create individual genome file: {}", individual_path.display()))?
-                );
+                let individual_path =
+                    output_dir.join(format!("{}{}", genome_id, QUERY_FILE_SUFFIX));
+
+                let mut individual_file =
+                    BufWriter::new(File::create(&individual_path).with_context(|| {
+                        format!(
+                            "Failed to create individual genome file: {}",
+                            individual_path.display()
+                        )
+                    })?);
                 bincode::serialize_into(&mut individual_file, &vec![genome_sketch.clone()])
                     .with_context(|| "Failed to serialize individual genome sketch")?;
-                info!("Individual genome sketch {} complete.", individual_path.display());
+                info!(
+                    "Individual genome sketch {} complete.",
+                    individual_path.display()
+                );
             }
-            
+
             let mut c = counter.lock().unwrap();
             *c += 1;
             if *c % 100 == 0 && *c != 0 {
                 info!("{} genomes processed.", *c);
             }
-            
+
             Ok(())
         })?;
     }
@@ -1277,4 +1336,90 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
 
     info!("Finished.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp_fasta(tag: &str, seq: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "meta2bseek_sketch_test_{}_{}.fa",
+            std::process::id(),
+            tag
+        ));
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, ">test_contig").unwrap();
+        writeln!(f, "{}", seq).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Deterministic pseudo-random ACGT sequence (LCG).
+    fn random_seq(len: usize, seed: u64) -> String {
+        let mut rng = seed;
+        (0..len)
+            .map(|_| {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[(rng >> 33) as usize & 3] as char
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_sketch_genome_sylph_faithful_keeps_repeated_kmers() {
+        // Period-4 sequence: every 31-mer recurs many times within the genome.
+        let seq = "ACGT".repeat(200); // 800 bp
+        let path = write_temp_fasta("rep", &seq);
+
+        // Default behavior: k-mers repeated in the genome are deleted outright.
+        let default_sketch = sketch_genome(1, 31, &path, 0, false, false).unwrap();
+        assert!(
+            default_sketch.genome_kmers.is_empty(),
+            "all k-mers repeat -> default mode deletes them all"
+        );
+
+        // sylph-faithful: repeated k-mers keep a single copy (sort + dedup).
+        let faithful = sketch_genome(1, 31, &path, 0, false, true).unwrap();
+        assert!(
+            !faithful.genome_kmers.is_empty(),
+            "sylph-faithful must keep one copy of each repeated k-mer"
+        );
+        let mut sorted = faithful.genome_kmers.clone();
+        sorted.sort_unstable();
+        let unique_count = {
+            let mut s = sorted.clone();
+            s.dedup();
+            s.len()
+        };
+        assert_eq!(
+            sorted.len(),
+            unique_count,
+            "sylph-faithful sketch must not contain duplicate k-mers"
+        );
+        assert_eq!(faithful.min_spacing, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sketch_genome_faithful_matches_default_without_repeats() {
+        // Non-repetitive random sequence with min_spacing = 0: no k-mer repeats, so
+        // default and sylph-faithful modes must produce the same sketch.
+        let seq = random_seq(20_000, 0x9e3779b97f4a7c15);
+        let path = write_temp_fasta("rand", &seq);
+
+        let default_sketch = sketch_genome(1, 31, &path, 0, false, false).unwrap();
+        let faithful = sketch_genome(1, 31, &path, 0, false, true).unwrap();
+        let mut a = default_sketch.genome_kmers.clone();
+        let mut b = faithful.genome_kmers.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "without repeated k-mers the two modes must agree");
+        assert!(!a.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -135,8 +135,11 @@ pub struct SketchArgs {
     #[clap(long="k-size", default_value_t = 31, help_heading = "ALGORITHM", help = "K-mer size")]
     pub k: usize,
 
-    #[clap(long="min-spacing", default_value_t = 30, help_heading = "ALGORITHM", help = "Minimum spacing between selected k-mers")]
-    pub min_spacing_kmer: usize,
+    #[clap(long="min-spacing", help_heading = "ALGORITHM", help = "Minimum spacing between selected k-mers (default: 30; forced to 0 by --sylph-faithful)")]
+    pub min_spacing_kmer: Option<usize>,
+
+    #[clap(long="sylph-faithful", help_heading = "ALGORITHM", help = "Build sylph-equivalent sketches for benchmarking against sylph: keep one copy of k-mers repeated in a genome (dedup instead of deleting them) and force --min-spacing 0. Cannot be combined with an explicit non-zero --min-spacing.")]
+    pub sylph_faithful: bool,
 
     #[clap(long="individual", help_heading = "ALGORITHM", help = "Sketch each contig individually")]
     pub individual: bool,
@@ -211,6 +214,9 @@ pub struct ContainArgs {
 
     #[clap(long="mismatch", default_value_t = 0, help_heading = "ALGORITHM", help = "Maximum Hamming mismatches allowed when matching a reference 2bRAD tag to sample tags (0 or 1). 1 increases sensitivity to sequencing errors/strain variation but requires tag sequences in the database.")]
     pub mismatch: usize,
+
+    #[clap(long="sketch-mode", help_heading = "ALGORITHM", help = "Interpret .db/.sp inputs as k-mer sketches (Vec<GenomeSketch> / SequencesSketch) produced by `sketch` instead of 2bRAD tag files, and query them through the same containment/ANI engine. Requires --mismatch 0 (sketches store no tag sequences).")]
+    pub sketch_mode: bool,
 
     #[clap(long="read-error-rate", help_heading = "ALGORITHM", help = "Fixed per-base read error rate used for error-aware ANI inversion in --mismatch 1 mode. Overrides automatic estimation from top candidate genomes.")]
     pub read_error_rate: Option<f64>,
@@ -301,6 +307,9 @@ pub struct ProfileArgs {
 
     #[arg(long, default_value_t = 0, help_heading = "ALGORITHM", help = "Maximum Hamming mismatches allowed when matching a reference 2bRAD tag to sample tags (0 or 1).")]
     pub mismatch: usize,
+
+    #[arg(long, help_heading = "ALGORITHM", help = "Interpret --db-file as a k-mer sketch database (.db: Vec<GenomeSketch>) and --sample-file as sample sketches (.sp: SequencesSketch or merged Vec<SequencesSketch>) produced by `sketch`, and profile them through the same containment/ANI engine. Requires --mismatch 0 (sketches store no tag sequences).")]
+    pub sketch_mode: bool,
 
     #[arg(long, help_heading = "ALGORITHM", help = "Fixed per-base read error rate used for error-aware ANI inversion in --mismatch 1 mode. Overrides automatic estimation from top candidate genomes.")]
     pub read_error_rate: Option<f64>,

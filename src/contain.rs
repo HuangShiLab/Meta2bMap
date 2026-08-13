@@ -1,21 +1,25 @@
 use crate::cmdline::{ContainArgs, ProfileArgs};
-use anyhow::{Result, anyhow, Context};
-use std::collections::HashMap;
+use crate::constants::{hash_bytes, Hash};
+use anyhow::{anyhow, Context, Result};
 use fxhash::FxHashMap;
+use memory_stats::memory_stats;
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
-use rayon::prelude::*;
-use std::sync::Mutex;
-use std::sync::Arc;
-use std::collections::HashSet;
 use std::path::PathBuf;
-use crate::constants::{Hash, hash_bytes};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use memory_stats::memory_stats;
 
-pub use crate::extract::{SyldbEntry, SylspEntry, TagHash, one_mismatch_canonical_hashes, ani_from_containment_one_mismatch, ani_from_containment_one_mismatch_err};
-
+use crate::extract::GenomeSketch;
+pub use crate::extract::{
+    ani_from_containment_one_mismatch, ani_from_containment_one_mismatch_err,
+    one_mismatch_canonical_hashes, SyldbEntry, SylspEntry, TagHash,
+};
+use crate::sketch::SequencesSketch;
 
 // 内存监控和限制功能 - 采用 sylph 的真正实现
 // pub fn check_vram_and_block(max_ram: usize, file: &str) {
@@ -308,10 +312,155 @@ fn build_winner_table<'a>(
     (tag_to_genome_map, interner)
 }
 
+// Per-sample winner-table recalculation — the core of recalculate_with_winner_table.
+// Shared by the 2bRAD path (counts built from SylspEntry lists) and the sketch path
+// (counts borrowed directly from SequencesSketch::kmer_counts).
+#[allow(clippy::too_many_arguments)]
+fn recalculate_one_sample_with_winner_table(
+    sample_source: &str,
+    sample_counts: &FxHashMap<Hash, u32>,
+    total_sample_tags: usize,
+    db_entries: &[SyldbEntry],
+    winner_map: &FxHashMap<Hash, WinnerTableEntry>,
+    interner: &GenomeInterner,
+    min_ani: f64,
+    log_reassign: bool,
+    mismatch: usize,
+    min_shared_tags: usize,
+    min_tags_genome: usize,
+    read_error_rate: Option<f64>,
+    no_error_correction: bool,
+    initial_by_contig: &FxHashMap<&str, &QueryResult>,
+    reassign_protection: bool,
+) -> Vec<QueryResult> {
+    let error_rate = sample_error_rate(
+        db_entries,
+        sample_counts,
+        mismatch,
+        read_error_rate,
+        no_error_correction,
+    );
+    let mut results = Vec::new();
+
+    // 为每个基因组（已聚合）计算重新分配后的结果
+    for db_entry in db_entries {
+        // 最小标签数过滤
+        if db_entry.tags.len() < min_tags_genome {
+            continue;
+        }
+
+        let genome_id = extract_genome_id_from_path(&db_entry.genome_source);
+        // 当前基因组在 winner table 中的索引（若从未赢得任何 tag 则为 None）
+        let my_idx = interner.get(genome_id);
+        let mut covs: Vec<u32> = Vec::new();
+        let mut tags_lost_count = 0;
+
+        // 只统计被 winner table 判给当前基因组的 tag 的覆盖度
+        for (i, tag) in db_entry.tags.iter().enumerate() {
+            let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+            let c = match lookup_tag_coverage(*tag, seq, sample_counts, mismatch) {
+                Some(c) if c > 0 => c,
+                _ => continue,
+            };
+            // winner table 目前基于 exact tag hash 构建；mismatch 命中时若 exact hash 不在 winner_map 中，
+            // 则保守地视为归属于当前基因组（不扣除），避免过度惩罚真实但带 1 mismatch 的 tag。
+            match winner_map.get(tag) {
+                Some(winner_entry) if Some(winner_entry.genome_idx) != my_idx => {
+                    tags_lost_count += 1; // 该 tag 被分配给了其他基因组
+                }
+                _ => {
+                    covs.push(c); // 归当前基因组所有
+                }
+            }
+        }
+
+        let total_ref_tags = db_entry.tags.len();
+
+        if log_reassign && tags_lost_count > 0 {
+            eprintln!(
+                "Genome {} in sample {}: owned_tags={}, lost_tags={}, total_ref_tags={}",
+                genome_id,
+                sample_source,
+                covs.len(),
+                tags_lost_count,
+                total_ref_tags
+            );
+        }
+
+        // 覆盖度校正后的统计
+        let mut result = calculate_statistics(
+            covs,
+            &db_entry.tag_lengths,
+            total_sample_tags,
+            total_ref_tags,
+            mismatch,
+            error_rate,
+        );
+        result.sample_file = sample_source.to_string();
+        result.genome_file = genome_id.to_string();
+        result.contig_name = db_entry.sequence_id.clone();
+
+        // 应用profile专用的过滤条件
+        if filter_results_for_profile(&result, Some(min_ani), min_shared_tags, min_tags_genome) {
+            results.push(result);
+        } else if reassign_protection {
+            // 过度剥离保护：winner-take-all 在密集多酶库上会把近缘菌株的整个 tag 集判给
+            // 赢家，导致输家 post-reassignment ANI/shared_tags 崩塌并被 min-ani 过滤掉
+            // （此时 filter_over_reassigned_genomes 根本来不及触发）。触发条件（v2，
+            // 两个条件同时满足）：
+            //   (a) 近全灭：重分配后存活的命中 tag ≤ REASSIGN_PROTECT_SURVIVAL_FRAC ×
+            //       初始共享 tag 数（真阳性湮灭的特征是 2312/2312 全丢；普通菌株簇
+            //       输家只丢一部分，不应被保护 —— v1 的 >50% 丢失阈值在此非特异）；
+            //   (b) 强初始证据：初始共享 tag 数 ≥ max(REASSIGN_PROTECT_MIN_INITIAL_TAGS,
+            //       min_shared_tags)。
+            // 满足则以**重分配前**的 ANI/containment/tag 数保留该基因组。
+            //
+            // 设计取舍：
+            // - ANI/tag 数取初始值（检测证据不该被重分配摧毁），但 eff_cov 取
+            //   **重分配后**的值 —— 丰度只计入该基因组实际赢得的 tag，避免与赢家
+            //   双重计数（重分配只能调丰度，不能杀死检测）。
+            // - 防膨胀护栏：保留的基因组必须用其初始统计重新通过 profile 过滤
+            //   （min-ani 作用于初始 ANI，min_shared_tags 作用于初始共享数）；
+            //   初始 pass 本来已过滤过，这里显式复查以确保不变量。
+            if let Some(init) = initial_by_contig.get(db_entry.sequence_id.as_str()) {
+                let initial_shared = init.shared_tags;
+                let survival_frac = result.shared_tags as f64 / initial_shared.max(1) as f64;
+                let min_initial = min_shared_tags.max(REASSIGN_PROTECT_MIN_INITIAL_TAGS);
+                if survival_frac <= REASSIGN_PROTECT_SURVIVAL_FRAC
+                    && initial_shared >= min_initial
+                    && filter_results_for_profile(
+                        init,
+                        Some(min_ani),
+                        min_shared_tags,
+                        min_tags_genome,
+                    )
+                {
+                    let mut protected = (*init).clone();
+                    protected.sample_file = sample_source.to_string();
+                    protected.genome_file = genome_id.to_string();
+                    protected.contig_name = db_entry.sequence_id.clone();
+                    // 丰度相关字段用重分配后的值（只计实际赢得的 tag）
+                    protected.eff_cov = result.eff_cov;
+                    protected.eff_lambda = result.eff_lambda;
+                    eprintln!(
+                        "Reassignment protection: genome {} in sample {} kept only {}/{} initial shared tags ({:.1}% survival) and was stripped below the reporting floor; keeping pre-reassignment ANI {:.2} with post-reassignment eff_cov {:.4} (reassignment-contested)",
+                        genome_id, sample_source, result.shared_tags, initial_shared,
+                        survival_frac * 100.0, protected.adjusted_ani, protected.eff_cov
+                    );
+                    results.push(protected);
+                }
+            }
+        }
+    }
+
+    results
+}
+
 // 使用winner table重新计算统计结果 - 模仿sylph的get_stats函数
 //
 // `initial_results`：重分配前（初始 pass）的结果，用于过度剥离保护
 // （reassign_protection = true 时）。初始结果按 contig_name（= 聚合后的基因组 id）索引。
+#[allow(clippy::too_many_arguments)]
 fn recalculate_with_winner_table(
     db_entries: &[SyldbEntry],
     sample_entries: &[SylspEntry],
@@ -355,108 +504,26 @@ fn recalculate_with_winner_table(
     for (sample_source, group_entries) in sample_groups {
         let sample_counts = sample_tag_counts_ref(&group_entries);
         let total_sample_tags = group_entries.len();
-        let error_rate = sample_error_rate(db_entries, &sample_counts, mismatch, read_error_rate, no_error_correction);
-
-        // 为每个基因组（已聚合）计算重新分配后的结果
-        for db_entry in db_entries {
-            // 最小标签数过滤
-            if db_entry.tags.len() < min_tags_genome {
-                continue;
-            }
-
-            let genome_id = extract_genome_id_from_path(&db_entry.genome_source);
-            // 当前基因组在 winner table 中的索引（若从未赢得任何 tag 则为 None）
-            let my_idx = interner.get(genome_id);
-            let mut covs: Vec<u32> = Vec::new();
-            let mut tags_lost_count = 0;
-
-            // 只统计被 winner table 判给当前基因组的 tag 的覆盖度
-            for (i, tag) in db_entry.tags.iter().enumerate() {
-                let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                let c = match lookup_tag_coverage(*tag, seq, &sample_counts, mismatch) {
-                    Some(c) if c > 0 => c,
-                    _ => continue,
-                };
-                // winner table 目前基于 exact tag hash 构建；mismatch 命中时若 exact hash 不在 winner_map 中，
-                // 则保守地视为归属于当前基因组（不扣除），避免过度惩罚真实但带 1 mismatch 的 tag。
-                match winner_map.get(tag) {
-                    Some(winner_entry) if Some(winner_entry.genome_idx) != my_idx => {
-                        tags_lost_count += 1; // 该 tag 被分配给了其他基因组
-                    }
-                    _ => {
-                        covs.push(c); // 归当前基因组所有
-                    }
-                }
-            }
-
-            let total_ref_tags = db_entry.tags.len();
-
-            if log_reassign && tags_lost_count > 0 {
-                eprintln!("Genome {} in sample {}: owned_tags={}, lost_tags={}, total_ref_tags={}",
-                         genome_id, sample_source, covs.len(), tags_lost_count, total_ref_tags);
-            }
-
-            // 覆盖度校正后的统计
-            let mut result = calculate_statistics(covs, &db_entry.tag_lengths, total_sample_tags, total_ref_tags, mismatch, error_rate);
-            result.sample_file = sample_source.clone();
-            result.genome_file = genome_id.to_string();
-            result.contig_name = db_entry.sequence_id.clone();
-
-            // 应用profile专用的过滤条件
-            if filter_results_for_profile(&result, Some(min_ani), min_shared_tags, min_tags_genome)
-            {
-                all_results.push(result);
-            } else if reassign_protection {
-                // 过度剥离保护：winner-take-all 在密集多酶库上会把近缘菌株的整个 tag 集判给
-                // 赢家，导致输家 post-reassignment ANI/shared_tags 崩塌并被 min-ani 过滤掉
-                // （此时 filter_over_reassigned_genomes 根本来不及触发）。触发条件（v2，
-                // 两个条件同时满足）：
-                //   (a) 近全灭：重分配后存活的命中 tag ≤ REASSIGN_PROTECT_SURVIVAL_FRAC ×
-                //       初始共享 tag 数（真阳性湮灭的特征是 2312/2312 全丢；普通菌株簇
-                //       输家只丢一部分，不应被保护 —— v1 的 >50% 丢失阈值在此非特异）；
-                //   (b) 强初始证据：初始共享 tag 数 ≥ max(REASSIGN_PROTECT_MIN_INITIAL_TAGS,
-                //       min_shared_tags)。
-                // 满足则以**重分配前**的 ANI/containment/tag 数保留该基因组。
-                //
-                // 设计取舍：
-                // - ANI/tag 数取初始值（检测证据不该被重分配摧毁），但 eff_cov 取
-                //   **重分配后**的值 —— 丰度只计入该基因组实际赢得的 tag，避免与赢家
-                //   双重计数（重分配只能调丰度，不能杀死检测）。
-                // - 防膨胀护栏：保留的基因组必须用其初始统计重新通过 profile 过滤
-                //   （min-ani 作用于初始 ANI，min_shared_tags 作用于初始共享数）；
-                //   初始 pass 本来已过滤过，这里显式复查以确保不变量。
-                if let Some(init) = initial_by_contig.get(db_entry.sequence_id.as_str()) {
-                    let initial_shared = init.shared_tags;
-                    let survival_frac = result.shared_tags as f64 / initial_shared.max(1) as f64;
-                    let min_initial = min_shared_tags.max(REASSIGN_PROTECT_MIN_INITIAL_TAGS);
-                    if survival_frac <= REASSIGN_PROTECT_SURVIVAL_FRAC
-                        && initial_shared >= min_initial
-                        && filter_results_for_profile(
-                            init,
-                            Some(min_ani),
-                            min_shared_tags,
-                            min_tags_genome,
-                        )
-                    {
-                        let mut protected = (*init).clone();
-                        protected.sample_file = sample_source.clone();
-                        protected.genome_file = genome_id.to_string();
-                        protected.contig_name = db_entry.sequence_id.clone();
-                        // 丰度相关字段用重分配后的值（只计实际赢得的 tag）
-                        protected.eff_cov = result.eff_cov;
-                        protected.eff_lambda = result.eff_lambda;
-                        eprintln!(
-                            "Reassignment protection: genome {} in sample {} kept only {}/{} initial shared tags ({:.1}% survival) and was stripped below the reporting floor; keeping pre-reassignment ANI {:.2} with post-reassignment eff_cov {:.4} (reassignment-contested)",
-                            genome_id, sample_source, result.shared_tags, initial_shared,
-                            survival_frac * 100.0, protected.adjusted_ani, protected.eff_cov
-                        );
-                        all_results.push(protected);
-                    }
-                }
-            }
-        }
+        let mut results = recalculate_one_sample_with_winner_table(
+            &sample_source,
+            &sample_counts,
+            total_sample_tags,
+            db_entries,
+            winner_map,
+            interner,
+            min_ani,
+            log_reassign,
+            mismatch,
+            min_shared_tags,
+            min_tags_genome,
+            read_error_rate,
+            no_error_correction,
+            &initial_by_contig,
+            reassign_protection,
+        );
+        all_results.append(&mut results);
     }
-    
+
     eprintln!(
         "Recalculation completed: {} results after filtering",
         all_results.len()
@@ -641,14 +708,17 @@ impl Write for MultiWriter {
 }
 
 pub fn query(args: ContainArgs) -> Result<()> {
+    // sketch 模式下 mismatch 需要 tag 序列生成 1-mismatch 邻居，而 k-mer sketch 不存序列。
+    if args.sketch_mode && args.mismatch != 0 {
+        return Err(anyhow!(
+            "--sketch-mode requires --mismatch 0: k-mer sketches (.db/.sp) do not store tag sequences, so 1-mismatch neighbor generation is impossible"
+        ));
+    }
+
     // 首先测试文件格式
-    let db_files: Vec<_> = args.files.iter()
-        .filter(|f| f.ends_with(".db"))
-        .collect();
-    
-    let sample_files: Vec<_> = args.files.iter()
-        .filter(|f| f.ends_with(".sp"))
-        .collect();
+    let db_files: Vec<_> = args.files.iter().filter(|f| f.ends_with(".db")).collect();
+
+    let sample_files: Vec<_> = args.files.iter().filter(|f| f.ends_with(".sp")).collect();
 
     if db_files.is_empty() {
         return Err(anyhow!("No .db files found in input files"));
@@ -672,8 +742,18 @@ pub fn query(args: ContainArgs) -> Result<()> {
         let db_file = File::open(db_path)
             .with_context(|| format!("Failed to open database file: {}", db_path))?;
         let db_reader = BufReader::new(db_file);
-        let db_entries: Vec<SyldbEntry> = bincode::deserialize_from(db_reader)
-            .with_context(|| format!("Failed to deserialize database file: {}", db_path))?;
+        let db_entries: Vec<SyldbEntry> = if args.sketch_mode {
+            // sketch 模式：.db 是 Vec<GenomeSketch>，逐条适配成 SyldbEntry
+            let genome_sketches: Vec<GenomeSketch> = bincode::deserialize_from(db_reader)
+                .with_context(|| format!("Failed to deserialize sketch database file (--sketch-mode expects Vec<GenomeSketch>): {}", db_path))?;
+            genome_sketches
+                .iter()
+                .map(genome_sketch_to_syldb_entry)
+                .collect()
+        } else {
+            bincode::deserialize_from(db_reader)
+                .with_context(|| format!("Failed to deserialize database file: {}", db_path))?
+        };
         // 关键：按基因组聚合所有 contig（去重 tag），避免逐 contig 碎片化
         let db_entries = aggregate_db_by_genome(db_entries);
 
@@ -685,55 +765,150 @@ pub fn query(args: ContainArgs) -> Result<()> {
         ensure_tag_seqs_for_mismatch(&db_entries, args.mismatch)?;
 
         // 并行处理所有样本文件
-        sample_files.par_iter().try_for_each(|sample_path| -> Result<()> {
-            eprintln!("Processing sample file: {}", sample_path);
+        sample_files
+            .par_iter()
+            .try_for_each(|sample_path| -> Result<()> {
+                eprintln!("Processing sample file: {}", sample_path);
 
-            let sample_file = File::open(sample_path)
-                .with_context(|| format!("Failed to open sample file: {}", sample_path))?;
-            let sample_reader = BufReader::new(sample_file);
-            let sample_entries: Vec<SylspEntry> = bincode::deserialize_from(sample_reader)
-                .with_context(|| format!("Failed to deserialize sample file: {}", sample_path))?;
+                // sketch 模式：.sp 是 SequencesSketch（或合并的 Vec<SequencesSketch>），
+                // 直接借用 kmer_counts，不展开成逐条观测。
+                if args.sketch_mode {
+                    let sketches = load_sequences_sketches(sample_path)?;
+                    for sketch in &sketches {
+                        if sketch.kmer_counts.is_empty() {
+                            eprintln!(
+                                "Warning: Sample sketch {} in {} has no k-mers",
+                                sketch.file_name, sample_path
+                            );
+                            continue;
+                        }
+                        let sample_enzyme = sketch_enzyme_tag(sketch.c, sketch.k);
+                        check_enzyme_compat(
+                            db_enzyme.as_deref(),
+                            Some(&sample_enzyme),
+                            args.allow_enzyme_mismatch,
+                            sample_path,
+                        )?;
 
-            eprintln!("Found {} entries in sample", sample_entries.len());
+                        let (sample_source, sample_counts, total_sample_tags) =
+                            sketch_sample_view(sketch);
+                        eprintln!(
+                            "Sample {}: {} distinct k-mers, {} total observations",
+                            sample_source,
+                            sample_counts.len(),
+                            total_sample_tags
+                        );
+                        let error_rate = sample_error_rate(
+                            &db_entries,
+                            sample_counts,
+                            args.mismatch,
+                            args.read_error_rate,
+                            args.no_error_correction,
+                        );
 
-            // 检查样本数据的有效性
-            if sample_entries.is_empty() {
-                eprintln!("Warning: Sample {} has no tags", sample_path);
-                return Ok(());
-            }
+                        // 对每个基因组进行比对
+                        for db_entry in &db_entries {
+                            let covs: Vec<u32> = db_entry
+                                .tags
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, t)| {
+                                    let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                                    lookup_tag_coverage(*t, seq, sample_counts, args.mismatch)
+                                })
+                                .collect();
 
-            // 酶集合一致性检查（DB vs 样本 sketch）
-            check_enzyme_compat(db_enzyme.as_deref(), detect_sample_enzyme(&sample_entries).as_deref(), args.allow_enzyme_mismatch, sample_path)?;
+                            // 覆盖度校正后的 ANI 统计
+                            let mut result = calculate_statistics(
+                                covs,
+                                &db_entry.tag_lengths,
+                                total_sample_tags,
+                                db_entry.tags.len(),
+                                args.mismatch,
+                                error_rate,
+                            );
+                            result.sample_file = sample_source.clone();
+                            result.genome_file = db_path.to_string();
+                            result.contig_name = db_entry.sequence_id.clone();
 
-            // 统计样本中每个 tag 的覆盖度（重数），用于覆盖度校正
-            let sample_counts = sample_tag_counts(&sample_entries);
-            let total_sample_tags = sample_entries.len();
-            eprintln!("Total tags in sample: {}", total_sample_tags);
-            let error_rate = sample_error_rate(&db_entries, &sample_counts, args.mismatch, args.read_error_rate, args.no_error_correction);
-
-            // 对每个基因组进行比对
-            for db_entry in &db_entries {
-                // 命中 tag 的覆盖度向量（支持 ≤1 mismatch）
-                let covs: Vec<u32> = db_entry.tags.iter().enumerate()
-                    .filter_map(|(i, t)| {
-                        let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                        lookup_tag_coverage(*t, seq, &sample_counts, args.mismatch)
-                    })
-                    .collect();
-
-                // 覆盖度校正后的 ANI 统计
-                let mut result = calculate_statistics(covs, &db_entry.tag_lengths, total_sample_tags, db_entry.tags.len(), args.mismatch, error_rate);
-                result.sample_file = sample_path.to_string();
-                result.genome_file = db_path.to_string();
-                result.contig_name = db_entry.sequence_id.clone();
-
-                // 应用过滤条件
-                if filter_results(&result, args.minimum_ani, args.min_tags_genome) {
-                    print_result(&result, &writer)?;
+                            // 应用过滤条件
+                            if filter_results(&result, args.minimum_ani, args.min_tags_genome) {
+                                print_result(&result, &writer)?;
+                            }
+                        }
+                    }
+                    return Ok(());
                 }
-            }
-            Ok(())
-        })?;
+
+                let sample_file = File::open(sample_path)
+                    .with_context(|| format!("Failed to open sample file: {}", sample_path))?;
+                let sample_reader = BufReader::new(sample_file);
+                let sample_entries: Vec<SylspEntry> = bincode::deserialize_from(sample_reader)
+                    .with_context(|| {
+                        format!("Failed to deserialize sample file: {}", sample_path)
+                    })?;
+
+                eprintln!("Found {} entries in sample", sample_entries.len());
+
+                // 检查样本数据的有效性
+                if sample_entries.is_empty() {
+                    eprintln!("Warning: Sample {} has no tags", sample_path);
+                    return Ok(());
+                }
+
+                // 酶集合一致性检查（DB vs 样本 sketch）
+                check_enzyme_compat(
+                    db_enzyme.as_deref(),
+                    detect_sample_enzyme(&sample_entries).as_deref(),
+                    args.allow_enzyme_mismatch,
+                    sample_path,
+                )?;
+
+                // 统计样本中每个 tag 的覆盖度（重数），用于覆盖度校正
+                let sample_counts = sample_tag_counts(&sample_entries);
+                let total_sample_tags = sample_entries.len();
+                eprintln!("Total tags in sample: {}", total_sample_tags);
+                let error_rate = sample_error_rate(
+                    &db_entries,
+                    &sample_counts,
+                    args.mismatch,
+                    args.read_error_rate,
+                    args.no_error_correction,
+                );
+
+                // 对每个基因组进行比对
+                for db_entry in &db_entries {
+                    // 命中 tag 的覆盖度向量（支持 ≤1 mismatch）
+                    let covs: Vec<u32> = db_entry
+                        .tags
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, t)| {
+                            let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                            lookup_tag_coverage(*t, seq, &sample_counts, args.mismatch)
+                        })
+                        .collect();
+
+                    // 覆盖度校正后的 ANI 统计
+                    let mut result = calculate_statistics(
+                        covs,
+                        &db_entry.tag_lengths,
+                        total_sample_tags,
+                        db_entry.tags.len(),
+                        args.mismatch,
+                        error_rate,
+                    );
+                    result.sample_file = sample_path.to_string();
+                    result.genome_file = db_path.to_string();
+                    result.contig_name = db_entry.sequence_id.clone();
+
+                    // 应用过滤条件
+                    if filter_results(&result, args.minimum_ani, args.min_tags_genome) {
+                        print_result(&result, &writer)?;
+                    }
+                }
+                Ok(())
+            })?;
     }
 
     Ok(())
@@ -1078,6 +1253,65 @@ fn ensure_tag_seqs_for_mismatch(entries: &[SyldbEntry], mismatch: usize) -> Resu
     Ok(())
 }
 
+// ---- sketch-mode adapters: run k-mer sketches through the 2bRAD profiling engine ----
+
+/// Self-describing "enzyme" string for sketch-mode inputs. Both the database and the
+/// sample side derive it with the same rule, so the existing `check_enzyme_compat`
+/// passes natively when c and k match (and hard-errors when they do not).
+fn sketch_enzyme_tag(c: usize, k: usize) -> String {
+    format!("kmer_c{}_k{}", c, k)
+}
+
+/// Adapt a k-mer `GenomeSketch` into a `SyldbEntry` so the entire profiling engine
+/// (per-genome aggregation, containment/ANI statistics, winner-take-all reassignment)
+/// is reused unchanged. `aggregate_db_by_genome` downstream deduplicates `tags`.
+/// Sketches store no tag sequences, so `tag_seqs` is None and only --mismatch 0 is valid.
+fn genome_sketch_to_syldb_entry(sketch: &GenomeSketch) -> SyldbEntry {
+    SyldbEntry {
+        sequence_id: sketch.file_name.clone(),
+        tags: sketch.genome_kmers.clone(),
+        tag_lengths: vec![sketch.k as u8; sketch.genome_kmers.len()],
+        genome_source: sketch.file_name.clone(),
+        tag_uniqueness: None,
+        tag_seqs: None,
+        enzyme: sketch_enzyme_tag(sketch.c, sketch.k),
+    }
+}
+
+/// Load a sketch-mode sample file: either a single `SequencesSketch` or a merged
+/// `Vec<SequencesSketch>` (same two-form deserialization as `view`).
+fn load_sequences_sketches(sample_path: &str) -> Result<Vec<SequencesSketch>> {
+    let file = File::open(sample_path)
+        .with_context(|| format!("Failed to open sample file: {}", sample_path))?;
+    let reader = BufReader::with_capacity(100_000_000, file);
+    if let Ok(sketch) = bincode::deserialize_from::<_, SequencesSketch>(reader) {
+        return Ok(vec![sketch]);
+    }
+    // First attempt consumed the reader; reopen before trying the merged form.
+    let file = File::open(sample_path)
+        .with_context(|| format!("Failed to open sample file: {}", sample_path))?;
+    let reader = BufReader::with_capacity(100_000_000, file);
+    let sketches: Vec<SequencesSketch> = bincode::deserialize_from(reader)
+        .with_context(|| format!(
+            "Failed to deserialize sample sketch file (--sketch-mode expects SequencesSketch or Vec<SequencesSketch>): {}",
+            sample_path
+        ))?;
+    Ok(sketches)
+}
+
+/// Per-sample view of a `SequencesSketch`: (sample source, k-mer counts, total observations).
+/// The counts map is borrowed directly — it is NEVER expanded into per-observation
+/// entries (real samples hold tens of millions of observations; expanding them would
+/// explode memory).
+fn sketch_sample_view(sketch: &SequencesSketch) -> (String, &FxHashMap<Hash, u32>, usize) {
+    let source = sketch
+        .sample_name
+        .clone()
+        .unwrap_or_else(|| sketch.file_name.clone());
+    let total = sketch.kmer_counts.values().map(|&c| c as usize).sum();
+    (source, &sketch.kmer_counts, total)
+}
+
 fn aggregate_db_by_genome(entries: Vec<SyldbEntry>) -> Vec<SyldbEntry> {
     let mut map: FxHashMap<String, SyldbEntry> = FxHashMap::default();
     for e in entries {
@@ -1342,6 +1576,74 @@ fn filter_results_for_profile(result: &QueryResult, min_ani: Option<f64>, min_sh
     result.adjusted_ani >= effective_min_ani
 }
 
+// Per-sample comparison against the cached, genome-aggregated database — the core of
+// query_single_file_with_cached_db. Shared by the 2bRAD path (counts built from
+// SylspEntry lists via sample_tag_counts_ref) and the sketch path (counts borrowed
+// directly from SequencesSketch::kmer_counts).
+#[allow(clippy::too_many_arguments)]
+fn query_one_sample_with_cached_db(
+    sample_source: &str,
+    sample_counts: &FxHashMap<Hash, u32>,
+    total_sample_tags: usize,
+    db_path: &str,
+    cached_db_entries: &[SyldbEntry],
+    min_ani: f64,
+    mismatch: usize,
+    min_shared_tags: usize,
+    min_tags_genome: usize,
+    read_error_rate: Option<f64>,
+    no_error_correction: bool,
+) -> Vec<QueryResult> {
+    let error_rate = sample_error_rate(
+        cached_db_entries,
+        sample_counts,
+        mismatch,
+        read_error_rate,
+        no_error_correction,
+    );
+
+    // 并行处理每个基因组（已按基因组聚合）进行比对
+    cached_db_entries
+        .par_iter()
+        .filter_map(|db_entry| {
+            // 基因组太小/太碎则跳过（sylph min_number_kmers）
+            if db_entry.tags.len() < min_tags_genome {
+                return None;
+            }
+
+            let covs: Vec<u32> = db_entry
+                .tags
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                    lookup_tag_coverage(*t, seq, sample_counts, mismatch)
+                })
+                .collect();
+
+            let mut result = calculate_statistics(
+                covs,
+                &db_entry.tag_lengths,
+                total_sample_tags,
+                db_entry.tags.len(),
+                mismatch,
+                error_rate,
+            );
+            result.sample_file = sample_source.to_string();
+            result.genome_file = db_path.to_string();
+            result.contig_name = db_entry.sequence_id.clone();
+
+            // 应用profile专用的过滤条件
+            if filter_results_for_profile(&result, Some(min_ani), min_shared_tags, min_tags_genome)
+            {
+                Some(result)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 // 内部函数：使用缓存的数据库数据进行查询 - 优化大文件读取
 fn query_single_file_with_cached_db(
     sample_path: &str,
@@ -1372,51 +1674,43 @@ fn query_single_file_with_cached_db(
     // 按样本源分组 - 这是关键：处理合并文件中的多个样本
     let mut sample_groups: FxHashMap<String, Vec<&SylspEntry>> = FxHashMap::default();
     for entry in sample_entries {
-        sample_groups.entry(entry.sample_source.clone())
+        sample_groups
+            .entry(entry.sample_source.clone())
             .or_default()
             .push(entry);
     }
 
-    eprintln!("Found {} different sample sources in file: {:?}", 
-              sample_groups.len(), 
-              sample_groups.keys().collect::<Vec<_>>());
+    eprintln!(
+        "Found {} different sample sources in file: {:?}",
+        sample_groups.len(),
+        sample_groups.keys().collect::<Vec<_>>()
+    );
 
     // 并行处理每个样本组，然后合并结果
-    let mut all_results: Vec<QueryResult> = sample_groups.par_iter()
+    let mut all_results: Vec<QueryResult> = sample_groups
+        .par_iter()
         .flat_map(|(sample_source, entries)| {
-            eprintln!("Processing sample source: {} with {} entries", sample_source, entries.len());
-            
+            eprintln!(
+                "Processing sample source: {} with {} entries",
+                sample_source,
+                entries.len()
+            );
+
             // 统计样本中每个 tag 的覆盖度（重数）
             let sample_counts = sample_tag_counts_ref(entries);
-            let total_sample_tags = entries.len();
-            let error_rate = sample_error_rate(cached_db_entries, &sample_counts, mismatch, read_error_rate, no_error_correction);
-
-            // 并行处理每个基因组（已按基因组聚合）进行比对
-            cached_db_entries.par_iter().filter_map(|db_entry| {
-                // 基因组太小/太碎则跳过（sylph min_number_kmers）
-                if db_entry.tags.len() < min_tags_genome {
-                    return None;
-                }
-
-                let covs: Vec<u32> = db_entry.tags.iter().enumerate()
-                    .filter_map(|(i, t)| {
-                        let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                        lookup_tag_coverage(*t, seq, &sample_counts, mismatch)
-                    })
-                    .collect();
-
-                let mut result = calculate_statistics(covs, &db_entry.tag_lengths, total_sample_tags, db_entry.tags.len(), mismatch, error_rate);
-                result.sample_file = sample_source.clone();
-                result.genome_file = db_path.to_string();
-                result.contig_name = db_entry.sequence_id.clone();
-
-                // 应用profile专用的过滤条件
-                if filter_results_for_profile(&result, Some(min_ani), min_shared_tags, min_tags_genome) {
-                    Some(result)
-                } else {
-                    None
-                }
-            }).collect::<Vec<QueryResult>>()
+            query_one_sample_with_cached_db(
+                sample_source,
+                &sample_counts,
+                entries.len(),
+                db_path,
+                cached_db_entries,
+                min_ani,
+                mismatch,
+                min_shared_tags,
+                min_tags_genome,
+                read_error_rate,
+                no_error_correction,
+            )
         })
         .collect();
 
@@ -1934,6 +2228,14 @@ fn build_genome_mapping_from_cache(cached_db_entries: &[SyldbEntry]) -> FxHashMa
 
 // 更新profile函数
 pub fn profile(args: ProfileArgs) -> Result<()> {
+    // sketch 模式下 mismatch 需要 tag 序列生成 1-mismatch 邻居，而 k-mer sketch 不存序列。
+    // 该检查必须在任何文件 IO / 线程池初始化之前，保证快速失败。
+    if args.sketch_mode && args.mismatch != 0 {
+        return Err(anyhow!(
+            "--sketch-mode requires --mismatch 0: k-mer sketches (.db/.sp) do not store tag sequences, so 1-mismatch neighbor generation is impossible"
+        ));
+    }
+
     // 处理minimum_ani参数：如果没有传入参数，使用默认值
     let effective_min_ani = args.minimum_ani.unwrap_or(PROFILE_MIN_ANI);
     let min_eff_coverage = args.min_eff_coverage;
@@ -1959,8 +2261,18 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
     let db_file = File::open(&args.db_file)
         .with_context(|| format!("Failed to open database file: {}", args.db_file))?;
     let db_reader = BufReader::with_capacity(100_000_000, db_file); // 100MB 缓冲区
-    let cached_db_entries: Vec<SyldbEntry> = bincode::deserialize_from(db_reader)
-        .with_context(|| format!("Failed to deserialize database file: {}", args.db_file))?;
+    let cached_db_entries: Vec<SyldbEntry> = if args.sketch_mode {
+        // sketch 模式：.db 是 Vec<GenomeSketch>，逐条适配成 SyldbEntry
+        let genome_sketches: Vec<GenomeSketch> = bincode::deserialize_from(db_reader)
+            .with_context(|| format!("Failed to deserialize sketch database file (--sketch-mode expects Vec<GenomeSketch>): {}", args.db_file))?;
+        genome_sketches
+            .iter()
+            .map(genome_sketch_to_syldb_entry)
+            .collect()
+    } else {
+        bincode::deserialize_from(db_reader)
+            .with_context(|| format!("Failed to deserialize database file: {}", args.db_file))?
+    };
     // 关键：按基因组聚合所有 contig（去重 tag），整个 profile 流程按"整基因组"统计
     let cached_db_entries = aggregate_db_by_genome(cached_db_entries);
 
@@ -1980,113 +2292,264 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
     };
 
     let mut cached_sample_entries: FxHashMap<String, Vec<SylspEntry>> = FxHashMap::default();
+    let mut cached_sample_sketches: FxHashMap<String, Vec<SequencesSketch>> = FxHashMap::default();
     for sample_path in &sample_files {
-        let sample_file = File::open(sample_path)
-            .with_context(|| format!("Failed to open sample file: {}", sample_path))?;
-        let sample_reader = BufReader::with_capacity(100_000_000, sample_file); // 100MB 缓冲区
-        let sample_entries: Vec<SylspEntry> = bincode::deserialize_from(sample_reader)
-            .with_context(|| format!("Failed to deserialize sample file: {}", sample_path))?;
-        cached_sample_entries.insert(sample_path.clone(), sample_entries);
+        if args.sketch_mode {
+            // sketch 模式：.sp 是 SequencesSketch（或合并的 Vec<SequencesSketch>）。
+            // kmer_counts 保持 map 形式驻留，绝不展开成逐条观测（大样本会爆内存）。
+            let sketches = load_sequences_sketches(sample_path)?;
+            let total_kmers: usize = sketches.iter().map(|s| s.kmer_counts.len()).sum();
+            eprintln!(
+                "Cached {} sketch(es) with {} distinct k-mers from {}",
+                sketches.len(),
+                total_kmers,
+                sample_path
+            );
+            cached_sample_sketches.insert(sample_path.clone(), sketches);
+        } else {
+            let sample_file = File::open(sample_path)
+                .with_context(|| format!("Failed to open sample file: {}", sample_path))?;
+            let sample_reader = BufReader::with_capacity(100_000_000, sample_file); // 100MB 缓冲区
+            let sample_entries: Vec<SylspEntry> = bincode::deserialize_from(sample_reader)
+                .with_context(|| format!("Failed to deserialize sample file: {}", sample_path))?;
+            cached_sample_entries.insert(sample_path.clone(), sample_entries);
+        }
     }
-    eprintln!("Cached {} sample files", cached_sample_entries.len());
+    eprintln!("Cached {} sample files", sample_files.len());
 
     // 酶集合一致性检查：在并行流程开始前，对每个样本 sketch 与 DB 比较
     // （query_single_file_with_cached_db 的 Result 会被 `if let Ok` 吞掉，硬错误必须放在这里）。
-    for (sample_path, entries) in &cached_sample_entries {
-        check_enzyme_compat(db_enzyme.as_deref(), detect_sample_enzyme(entries).as_deref(), args.allow_enzyme_mismatch, sample_path)?;
+    // sketch 模式下两侧都用 sketch_enzyme_tag 生成自描述串，c/k 一致即天然通过。
+    for sample_path in &sample_files {
+        if args.sketch_mode {
+            if let Some(sketches) = cached_sample_sketches.get(sample_path) {
+                for sketch in sketches {
+                    let sample_enzyme = sketch_enzyme_tag(sketch.c, sketch.k);
+                    check_enzyme_compat(
+                        db_enzyme.as_deref(),
+                        Some(&sample_enzyme),
+                        args.allow_enzyme_mismatch,
+                        sample_path,
+                    )?;
+                }
+            }
+        } else if let Some(entries) = cached_sample_entries.get(sample_path) {
+            check_enzyme_compat(
+                db_enzyme.as_deref(),
+                detect_sample_enzyme(entries).as_deref(),
+                args.allow_enzyme_mismatch,
+                sample_path,
+            )?;
+        }
     }
 
     // 从缓存的数据库构建基因组映射关系
     let genome_mapping = build_genome_mapping_from_cache(&cached_db_entries);
-    
+
     // 创建输出写入器
     let mut writer = create_multi_writer(&args.out_file_name)?;
 
-
-
     // 存储所有样本的结果 - 预分配容量，使用 Mutex 保护
-    let all_results = Arc::new(Mutex::new(FxHashMap::<(String, String), GenomeProfileResult>::default()));
+    let all_results = Arc::new(Mutex::new(
+        FxHashMap::<(String, String), GenomeProfileResult>::default(),
+    ));
 
-        // 采用 sylph 的简化并行处理策略
-    let step = usize::max(args.threads/3 + 1, usize::min(sample_files.len(), args.threads));
-    let chunks: Vec<Vec<String>> = sample_files.chunks(step).map(|chunk| chunk.to_vec()).collect();
-    
+    // 采用 sylph 的简化并行处理策略
+    let step = usize::max(
+        args.threads / 3 + 1,
+        usize::min(sample_files.len(), args.threads),
+    );
+    let chunks: Vec<Vec<String>> = sample_files
+        .chunks(step)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
     // 使用 sylph 风格的分块处理，集成k-mer重新分配机制
     chunks.into_iter().for_each(|chunk| {
         chunk.into_par_iter().for_each(|sample_file| {
             // 第一阶段：计算初步结果（不使用重新分配）
-            if let Ok(initial_results) = query_single_file_with_cached_db(&sample_file, &args.db_file, &cached_db_entries, &cached_sample_entries, effective_min_ani, args.mismatch, min_shared_tags, min_tags_genome, args.read_error_rate, args.no_error_correction) {
+            let initial_results_opt: Option<Vec<QueryResult>> = if args.sketch_mode {
+                // sketch 模式：每个 SequencesSketch 是一个样本，直接借用 kmer_counts，
+                // 不展开成逐条观测。
+                cached_sample_sketches.get(&sample_file).map(|sketches| {
+                    let results: Vec<QueryResult> = sketches
+                        .par_iter()
+                        .filter(|s| !s.kmer_counts.is_empty())
+                        .flat_map(|sketch| {
+                            let (sample_source, sample_counts, total_sample_tags) =
+                                sketch_sample_view(sketch);
+                            eprintln!(
+                                "Processing sample sketch: {} with {} distinct k-mers",
+                                sample_source,
+                                sample_counts.len()
+                            );
+                            query_one_sample_with_cached_db(
+                                &sample_source,
+                                sample_counts,
+                                total_sample_tags,
+                                &args.db_file,
+                                &cached_db_entries,
+                                effective_min_ani,
+                                args.mismatch,
+                                min_shared_tags,
+                                min_tags_genome,
+                                args.read_error_rate,
+                                args.no_error_correction,
+                            )
+                        })
+                        .collect();
+                    results
+                })
+            } else {
+                query_single_file_with_cached_db(
+                    &sample_file,
+                    &args.db_file,
+                    &cached_db_entries,
+                    &cached_sample_entries,
+                    effective_min_ani,
+                    args.mismatch,
+                    min_shared_tags,
+                    min_tags_genome,
+                    args.read_error_rate,
+                    args.no_error_correction,
+                )
+                .ok()
+            };
+
+            if let Some(initial_results) = initial_results_opt {
                 // 按ANI排序
                 let mut initial_results = initial_results;
-                initial_results.sort_by(|a, b| b.adjusted_ani.partial_cmp(&a.adjusted_ani).unwrap());
-                
-                // 第二阶段：构建winner table并重新分配（模仿sylph的两阶段处理）
-                eprintln!("{} taxonomic profiling; reassigning tags for {} genomes...", &sample_file, initial_results.len());
-                
-                // 构建winner table
-                let (winner_map, interner) = build_winner_table(&initial_results, &cached_db_entries, true); // 启用日志
+                initial_results
+                    .sort_by(|a, b| b.adjusted_ani.partial_cmp(&a.adjusted_ani).unwrap());
 
-                // 使用winner table重新计算结果
-                if let Some(sample_entries) = cached_sample_entries.get(&sample_file) {
-                    let mut reassigned_results = recalculate_with_winner_table(
-                        &cached_db_entries,
-                        sample_entries,
-                        &winner_map,
-                        &interner,
-                        effective_min_ani,
-                        false,
-                        args.mismatch,
-                        min_shared_tags,
-                        min_tags_genome,
-                        args.read_error_rate,
-                        args.no_error_correction,
-                        &initial_results,
-                        args.reassign_protection,
-                    );
-                    
+                // 第二阶段：构建winner table并重新分配（模仿sylph的两阶段处理）
+                eprintln!(
+                    "{} taxonomic profiling; reassigning tags for {} genomes...",
+                    &sample_file,
+                    initial_results.len()
+                );
+
+                // 构建winner table
+                let (winner_map, interner) =
+                    build_winner_table(&initial_results, &cached_db_entries, true); // 启用日志
+
+                // 使用winner table重新计算结果。
+                // sketch 模式下没有 SylspEntry 列表；recalculate_abundances_after_reassignment
+                // 只用结果、不读样本条目，传空切片即可。
+                let empty_sample_entries: &[SylspEntry] = &[];
+                let sample_entries_opt: Option<&[SylspEntry]> = if args.sketch_mode {
+                    Some(empty_sample_entries)
+                } else {
+                    cached_sample_entries
+                        .get(&sample_file)
+                        .map(|v| v.as_slice())
+                };
+                if let Some(sample_entries) = sample_entries_opt {
+                    let mut reassigned_results = if args.sketch_mode {
+                        let sketches = cached_sample_sketches
+                            .get(&sample_file)
+                            .expect("sample sketch cache populated during loading");
+                        // 初始结果索引（与 recalculate_with_winner_table 内部一致）
+                        let initial_by_contig: FxHashMap<&str, &QueryResult> = initial_results
+                            .iter()
+                            .map(|r| (r.contig_name.as_str(), r))
+                            .collect();
+                        let mut out = Vec::new();
+                        for sketch in sketches {
+                            if sketch.kmer_counts.is_empty() {
+                                continue;
+                            }
+                            let (sample_source, sample_counts, total_sample_tags) =
+                                sketch_sample_view(sketch);
+                            let mut res = recalculate_one_sample_with_winner_table(
+                                &sample_source,
+                                sample_counts,
+                                total_sample_tags,
+                                &cached_db_entries,
+                                &winner_map,
+                                &interner,
+                                effective_min_ani,
+                                false,
+                                args.mismatch,
+                                min_shared_tags,
+                                min_tags_genome,
+                                args.read_error_rate,
+                                args.no_error_correction,
+                                &initial_by_contig,
+                                args.reassign_protection,
+                            );
+                            out.append(&mut res);
+                        }
+                        out
+                    } else {
+                        recalculate_with_winner_table(
+                            &cached_db_entries,
+                            sample_entries,
+                            &winner_map,
+                            &interner,
+                            effective_min_ani,
+                            false,
+                            args.mismatch,
+                            min_shared_tags,
+                            min_tags_genome,
+                            args.read_error_rate,
+                            args.no_error_correction,
+                            &initial_results,
+                            args.reassign_protection,
+                        )
+                    };
+
                     // 第三阶段：过滤过度重新分配的基因组
                     reassigned_results = filter_over_reassigned_genomes(
                         &initial_results,
                         &reassigned_results,
                         effective_min_ani,
-                        K
+                        K,
                     );
-                    
+
                     // 第四阶段：重新计算丰度
-                    recalculate_abundances_after_reassignment(&mut reassigned_results, sample_entries);
-                    
-                    eprintln!("{} has {} genomes passing profiling threshold after reassignment.", &sample_file, reassigned_results.len());
-                    
+                    recalculate_abundances_after_reassignment(
+                        &mut reassigned_results,
+                        sample_entries,
+                    );
+
+                    eprintln!(
+                        "{} has {} genomes passing profiling threshold after reassignment.",
+                        &sample_file,
+                        reassigned_results.len()
+                    );
+
                     // 按基因组ID分组结果 - 修复：确保每个样本源都被正确处理
                     for result in reassigned_results {
                         if let Some((genome_id, _)) = genome_mapping.get(&result.contig_name) {
                             // 关键修复：使用实际的样本源ID作为key的一部分
                             let key = (genome_id.clone(), result.sample_file.clone());
                             let mut all_results = all_results.lock().unwrap();
-                            let entry = all_results.entry(key)
-                                .or_insert_with(|| {
-                                    GenomeProfileResult {
-                                        genome_id: genome_id.clone(),
-                                        sample_id: result.sample_file.clone(), // 这里保存的是实际的样本源ID
-                                        file_path: sample_file.clone(),
-                                        adjusted_ani: 0.0,
-                                        taxonomic_abundance: 0.0,
-                                        sequence_abundance: 0.0,
-                                        common_tags: 0,
-                                        total_tags: 0,
-                                        eff_cov: 0.0,
-                                    }
-                                });
-                            
+                            let entry = all_results.entry(key).or_insert_with(|| {
+                                GenomeProfileResult {
+                                    genome_id: genome_id.clone(),
+                                    sample_id: result.sample_file.clone(), // 这里保存的是实际的样本源ID
+                                    file_path: sample_file.clone(),
+                                    adjusted_ani: 0.0,
+                                    taxonomic_abundance: 0.0,
+                                    sequence_abundance: 0.0,
+                                    common_tags: 0,
+                                    total_tags: 0,
+                                    eff_cov: 0.0,
+                                }
+                            });
+
                             // 累加标签数
                             entry.common_tags += result.shared_tags;
                             entry.total_tags += result.ref_tags;
                             entry.eff_cov += result.eff_cov;
-                            
+
                             // 使用共享标签数作为权重计算加权平均ANI
                             if entry.common_tags > 0 {
-                                entry.adjusted_ani = (entry.adjusted_ani * (entry.common_tags - result.shared_tags) as f64 
-                                    + result.adjusted_ani * result.shared_tags as f64) / entry.common_tags as f64;
+                                entry.adjusted_ani = (entry.adjusted_ani
+                                    * (entry.common_tags - result.shared_tags) as f64
+                                    + result.adjusted_ani * result.shared_tags as f64)
+                                    / entry.common_tags as f64;
                             }
                         }
                     }
@@ -2269,6 +2732,162 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_genome_sketch_adapter_fields() {
+        // Adapter must carry the k-mers over as tags, set every tag length to k,
+        // derive a self-describing enzyme string, and leave sequence-bearing fields empty.
+        let sketch = GenomeSketch {
+            file_name: "genome1".to_string(),
+            first_contig_name: "contig1".to_string(),
+            gn_size: 100_000,
+            c: 200,
+            k: 31,
+            min_spacing: 0,
+            genome_kmers: vec![5, 1, 9, 1, 5, 42],
+        };
+        let entry = genome_sketch_to_syldb_entry(&sketch);
+        assert_eq!(
+            entry.tags, sketch.genome_kmers,
+            "adapter keeps k-mers as-is (dedup happens downstream)"
+        );
+        assert_eq!(
+            entry.tag_lengths,
+            vec![31u8; 6],
+            "every tag length must equal k"
+        );
+        assert_eq!(entry.sequence_id, "genome1");
+        assert_eq!(entry.genome_source, "genome1");
+        assert!(entry.tag_uniqueness.is_none());
+        assert!(entry.tag_seqs.is_none(), "sketches store no tag sequences");
+        assert_eq!(entry.enzyme, "kmer_c200_k31");
+
+        // The same rule on the sample side makes check_enzyme_compat pass natively.
+        assert!(check_enzyme_compat(
+            Some(&entry.enzyme),
+            Some(&sketch_enzyme_tag(200, 31)),
+            false,
+            "t"
+        )
+        .is_ok());
+        // ... and hard-errors when c/k differ between DB and sample.
+        assert!(check_enzyme_compat(
+            Some(&entry.enzyme),
+            Some(&sketch_enzyme_tag(100, 31)),
+            false,
+            "t"
+        )
+        .is_err());
+
+        // After the standard per-genome aggregation, duplicate k-mers are deduplicated.
+        let agg = aggregate_db_by_genome(vec![entry]);
+        assert_eq!(agg.len(), 1);
+        let mut tags = agg[0].tags.clone();
+        tags.sort_unstable();
+        assert_eq!(tags, vec![1, 5, 9, 42]);
+        assert_eq!(agg[0].tag_lengths, vec![31u8; 4]);
+        assert_eq!(agg[0].enzyme, "kmer_c200_k31");
+    }
+
+    #[test]
+    fn test_sequences_sketch_view() {
+        let mut kmer_counts: FxHashMap<Hash, u32> = FxHashMap::default();
+        kmer_counts.insert(11, 3);
+        kmer_counts.insert(22, 7);
+        let sketch = SequencesSketch {
+            kmer_counts,
+            file_name: "sampleA.fq".to_string(),
+            c: 200,
+            k: 31,
+            paired: false,
+            sample_name: Some("sampleA".to_string()),
+            mean_read_length: 150.0,
+        };
+        let (source, counts, total) = sketch_sample_view(&sketch);
+        assert_eq!(source, "sampleA");
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.get(&11), Some(&3));
+        assert_eq!(
+            total, 10,
+            "total observations = sum of k-mer multiplicities"
+        );
+
+        // sample_name falls back to file_name when absent.
+        let mut unnamed = sketch.clone();
+        unnamed.sample_name = None;
+        assert_eq!(sketch_sample_view(&unnamed).0, "sampleA.fq");
+    }
+
+    #[test]
+    fn test_joint_ani_single_class_equals_sylph_pow() {
+        // With a single length class ℓ the information-weighted least squares degenerates
+        // to adj^(1/ℓ) — sylph's ANI = containment_adj^(1/k) for k-mer sketches (ℓ = k = 31).
+        for &(n, d) in &[(1000usize, 1000usize), (1000, 900), (500, 250), (2000, 3)] {
+            let mut classes: FxHashMap<u8, (usize, usize)> = FxHashMap::default();
+            classes.insert(31u8, (n, d));
+            for lambda in [None, Some(0.5), Some(2.0)] {
+                let ani = joint_ani_from_classes(&classes, lambda, 0, 0.0)
+                    .expect("single non-empty class must yield an ANI");
+                let c = d as f64 / n as f64;
+                let c_adj = match lambda {
+                    Some(lam) => (c / (1.0 - (-lam).exp())).min(1.0),
+                    None => c,
+                };
+                let expected = c_adj.powf(1.0 / 31.0);
+                assert!(
+                    (ani - expected).abs() < 1e-12,
+                    "n={} d={} lambda={:?}: joint={} expected adj^(1/31)={}",
+                    n,
+                    d,
+                    lambda,
+                    ani,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sketch_mode_rejects_mismatch() {
+        // --sketch-mode with --mismatch 1 must fail fast (before any file IO), because
+        // k-mer sketches do not store tag sequences needed for neighbor generation.
+        fn make_args(mismatch: usize) -> ProfileArgs {
+            ProfileArgs {
+                sample_file: "nonexistent.sp".to_string(),
+                db_file: "nonexistent.db".to_string(),
+                minimum_ani: None,
+                threads: 1,
+                mismatch,
+                read_error_rate: None,
+                no_error_correction: false,
+                allow_enzyme_mismatch: false,
+                out_file_name: None,
+                log_path: None,
+                tsv_name: "abundance_matrix.tsv".to_string(),
+                taxonomy_file: None,
+                gscore_threshold: 10.0,
+                min_eff_coverage: 0.0,
+                min_shared_tags: MIN_SHARED_TAGS_FOR_PROFILE,
+                min_tags_genome: MIN_TAGS_FOR_GENOME,
+                reassign_protection: false,
+                sketch_mode: true,
+            }
+        }
+        let err = profile(make_args(1)).expect_err("sketch mode + mismatch 1 must be a hard error");
+        assert!(
+            err.to_string().contains("--mismatch 0"),
+            "error should explain the mismatch restriction, got: {}",
+            err
+        );
+
+        // mismatch 0 passes the guard and fails later on the missing files instead.
+        let err_ok = profile(make_args(0)).expect_err("missing files still error");
+        assert!(
+            !err_ok.to_string().contains("--mismatch 0"),
+            "mismatch guard must not fire for --mismatch 0, got: {}",
+            err_ok
+        );
+    }
 
     fn dummy_result(shared: usize, ref_tags: usize, ani: f64) -> QueryResult {
         QueryResult {

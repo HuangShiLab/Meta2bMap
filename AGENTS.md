@@ -83,8 +83,8 @@ Current test coverage is modest: unit tests live in `#[cfg(test)] mod tests` blo
 
 - **`cmdline.rs`** — All `clap` argument structs (`ExtractArgs`, `SketchArgs`, `ContainArgs`, `ProfileArgs`, `InspectArgs`, `ViewArgs`, `MarkArgs`) and the `Mode` enum. This is the single source of truth for CLI flags.
 - **`extract.rs`** — Restriction-enzyme definitions (`ENZYME_DEFINITIONS`, `ENZYME_TAG_LENGTHS`), canonical tag extraction, parallel FASTA/FASTQ processing, and serialization of `SyldbEntry` / `SylspEntry`. Also contains memory-throttling helpers.
-- **`sketch.rs`** — k-mer extraction, minimap2-style hashing, cuckoo-filter deduplication, and serialization of `SequencesSketch` / `GenomeSketch`.
-- **`contain.rs`** — Core containment/ANI statistics, winner-table tag reassignment, species-level aggregation from a GTDB-style taxonomy file, and TSV output generation. This is the largest module.
+- **`sketch.rs`** — k-mer extraction, minimap2-style hashing, cuckoo-filter deduplication, and serialization of `SequencesSketch` / `GenomeSketch`. `sketch --sylph-faithful` builds sylph-equivalent sketches (dedup instead of deleting repeated genomic k-mers, min-spacing forced to 0) for benchmarking.
+- **`contain.rs`** — Core containment/ANI statistics, winner-table tag reassignment, species-level aggregation from a GTDB-style taxonomy file, and TSV output generation. This is the largest module. `profile --sketch-mode` (and `query --sketch-mode`) adapt `GenomeSketch`/`SequencesSketch` files into the same engine via `genome_sketch_to_syldb_entry` / `sketch_sample_view` (enzyme tag `kmer_c{c}_k{k}`; requires `--mismatch 0`).
 - **`query.rs`** — A standalone, simpler debug-style containment query implementation that operates on `.db` and `.sp` files.
 - **`inspect.rs`** / **`view.rs`** — Diagnostic commands that deserialize `.db`/`.sp` files and emit YAML or TSV summaries.
 - **`mark.rs`** — Reads a `.db`, determines which tags are unique to a single genome source, and writes the file back with a `tag_uniqueness` vector per entry.
@@ -141,7 +141,7 @@ Run the full test suite:
 cargo test
 ```
 
-The current suite is small (15 lib + 18 bin tests as of the over-stripping protection fix). There are no integration tests, no CI configuration, and no sample test data in the repository.
+The current suite is small (21 lib + 24 bin tests as of the sketch-mode profiling change). There are no integration tests, no CI configuration, and no sample test data in the repository.
 
 When adding new functionality, add unit tests under `#[cfg(test)] mod tests` in the relevant module and, where practical, add a small integration test using sample FASTA/FASTQ fixtures.
 
