@@ -87,7 +87,7 @@ pub struct ExtractArgs {
     #[clap(short='l', long="list-sequence", help_heading = "INPUT", help = "File containing list of input sequences")]
     pub list_sequence: Option<String>,
 
-    #[clap(long="max-ram", help_heading = "MEMORY", help = "Maximum RAM usage in GB (default: 16)")]
+    #[clap(long="max-ram", help_heading = "MEMORY", help = "Maximum RAM usage in GB (default: 75% of total system memory)")]
     pub max_ram: Option<usize>,
 
     #[clap(long="no-tag-seqs", help_heading = "ALGORITHM", help = "Do not store tag sequences in the .syldb (saves ~4-5x memory/disk for large databases; --mismatch 1 will be unavailable)")]

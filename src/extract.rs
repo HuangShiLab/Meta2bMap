@@ -72,30 +72,53 @@ fn calculate_optimal_buffer_size(file_size: u64, is_compressed: bool) -> usize {
 
 // 内存监控函数，参考sketch中的check_vram_and_block
 // 使用 physical_mem 而非 virtual_mem，避免 macOS 上虚拟地址空间过大导致死锁。
+// 注意：阻塞期间所有并行线程可能互相等待（谁都不释放内存）形成死锁，
+// 因此阻塞必须有上限和可见的告警——宁可超时后继续（最坏是 OOM，错误可见），
+// 也不能无声地无限挂起。
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
         let mut gb_usage_curr = usage.physical_mem as f64 / 1_000_000_000 as f64;
         if (max_ram as f64) < gb_usage_curr {
-            log::debug!(
-                "Max memory reached. Blocking extract for {}. Curr memory {}, max mem {}",
-                file,
-                gb_usage_curr,
-                max_ram
+            eprintln!(
+                "WARNING: memory limit reached ({:.1} GB > {} GB). Blocking extract for {} until memory frees. If this persists, re-run with a higher --max-ram.",
+                gb_usage_curr, max_ram, file
             );
         }
+        let mut blocked_secs = 0u64;
         while (max_ram as f64) < gb_usage_curr {
-            let five_second = Duration::from_secs(1);
-            thread::sleep(five_second);
+            thread::sleep(Duration::from_secs(5));
+            blocked_secs += 5;
             if let Some(usage) = memory_stats() {
                 gb_usage_curr = usage.physical_mem as f64 / 1_000_000_000 as f64;
-                if (max_ram as f64) >= gb_usage_curr {
-                    log::debug!("Extract for {} freed", file);
-                }
             } else {
                 break;
             }
+            if blocked_secs >= 600 {
+                eprintln!(
+                    "WARNING: extract for {} blocked for >10 min at {:.1} GB (limit {} GB); worker threads may be waiting on each other (deadlock). Proceeding anyway; consider a higher --max-ram.",
+                    file, gb_usage_curr, max_ram
+                );
+                break;
+            }
+            if blocked_secs % 60 == 0 {
+                eprintln!(
+                    "WARNING: extract for {} still blocked: {:.1} GB > {} GB limit",
+                    file, gb_usage_curr, max_ram
+                );
+            }
         }
     }
+}
+
+// 默认内存上限：总物理内存的 75%。旧版硬编码 16GB 在现代机器上会频繁误触发
+// 上面的阻塞 guard——多个并行线程同时阻塞会互相等待形成死锁（HPC 建库曾因此
+// 无声挂死数小时）。下限 7GB 与 extract() 的显式校验保持一致。
+pub fn default_max_ram_gb() -> usize {
+    use sysinfo::SystemExt;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total_gb = sys.total_memory() as f64 / 1_000_000_000.0;
+    ((total_gb * 0.75) as usize).max(7)
 }
 
 // 动态内存管理函数
@@ -973,10 +996,14 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
     std::fs::create_dir_all(&args.sample_output_dir)
         .context("Failed to create output directory")?;
 
-    // 设置内存限制，如果没有指定则使用默认值
-    let max_ram = args.max_ram.unwrap_or(16); // 默认16GB内存限制
+    // 设置内存限制：未指定时取总物理内存的 75%（旧默认 16GB 会在并行建库时
+    // 触发阻塞式 guard 导致死锁，见 check_vram_and_block 注释）
+    let max_ram = args.max_ram.unwrap_or_else(default_max_ram_gb);
     if max_ram < 7 {
         return Err(anyhow::anyhow!("Max ram must be >= 7. Exiting."));
+    }
+    if args.max_ram.is_none() {
+        eprintln!("Memory limit: {} GB (default 75% of total RAM; override with --max-ram)", max_ram);
     }
 
     // 处理单对双端测序文件（-1 和 -2 参数）
