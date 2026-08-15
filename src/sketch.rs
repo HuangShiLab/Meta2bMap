@@ -459,19 +459,12 @@ fn parse_genome_list_file(file_name: &str) -> Result<Vec<(String, String)>> {
                 result.push((genome_id, path));
             }
         } else {
-            // 单列格式：从文件名推导 genome_id
+            // 单列格式：从文件名推导 genome_id（逐字保留文件名，不剥离扩展名）
             let path = line.to_string();
             let genome_id = Path::new(&path)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or(&path)
-                .strip_suffix(".fasta.gz")
-                .or_else(|| Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).strip_suffix(".fasta"))
-                .or_else(|| Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).strip_suffix(".fa.gz"))
-                .or_else(|| Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).strip_suffix(".fa"))
-                .or_else(|| Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).strip_suffix(".fna.gz"))
-                .or_else(|| Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).strip_suffix(".fna"))
-                .unwrap_or_else(|| Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path))
                 .to_string();
             result.push((genome_id, path));
         }

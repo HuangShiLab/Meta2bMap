@@ -1799,6 +1799,7 @@ pub fn query_single_file(sample_path: &str, db_path: &str, min_ani: f64, mismatc
 }
 
 // 从文件路径中提取基因组ID的函数
+// 基因组 ID 与输入文件名逐字一致（不剥离扩展名）
 fn extract_genome_id(file_path: &str) -> String {
     let path = std::path::Path::new(file_path);
     
@@ -1807,20 +1808,7 @@ fn extract_genome_id(file_path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("");
     
-    // 移除.fasta.gz或.fasta扩展名
-    let name_without_ext = file_name
-        .strip_suffix(".fasta.gz")
-        .or_else(|| file_name.strip_suffix(".fasta"))
-        .unwrap_or(file_name);
-    
-    // 从test_files/目录中提取
-    let clean_name = if let Some(stripped) = name_without_ext.strip_prefix("test_files/") {
-        stripped
-    } else {
-        name_without_ext
-    };
-    
-    clean_name.to_string()
+    file_name.to_string()
 }
 
 // 读取taxonomy文件并建立genome到分类信息的映射
@@ -1915,8 +1903,12 @@ fn aggregate_to_species_level(
                 // 从genome_id中提取标准化的genome标识符
                 let genome_id = extract_genome_id_from_path(&genome_result.genome_id);
                 
-                // 查找对应的分类信息 - 使用字符串切片
-                if let Some(taxonomy_arc) = taxonomy_map.get(genome_id) {
+                // 查找对应的分类信息：先按逐字 ID 查，再回退到剥离扩展名的旧式 ID
+                // （taxonomy 文件的键历史上不带 .fasta 等扩展名）
+                let taxonomy_arc = taxonomy_map.get(genome_id).or_else(|| {
+                    strip_genome_extension(genome_id).and_then(|stripped| taxonomy_map.get(stripped))
+                });
+                if let Some(taxonomy_arc) = taxonomy_arc {
                     let species_key = taxonomy_arc.get_species_key();
                     
                     // 获取或创建物种条目 - 使用 Arc 共享而不是克隆
@@ -1989,23 +1981,26 @@ fn aggregate_to_species_level(
 }
 
 // 从文件路径或genome_id中提取标准化的genome标识符
+// 注意：不剥离扩展名，基因组 ID 与输入文件名逐字一致（与 sylph 行为相同），
+// 保证下游 ground truth / 评分脚本能直接按文件名 join。
 fn extract_genome_id_from_path(input: &str) -> &str {
     // 如果输入包含路径分隔符，提取文件名
-    let file_name = if input.contains('/') {
+    if input.contains('/') {
         std::path::Path::new(input)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(input)
     } else {
         input
-    };
-    
-    // 移除可能的文件扩展名 - 返回字符串切片而不是 String
-    file_name
-        .strip_suffix(".fasta.gz").or_else(|| file_name.strip_suffix(".fasta"))
-        .or_else(|| file_name.strip_suffix(".fa.gz")).or_else(|| file_name.strip_suffix(".fa"))
-        .or_else(|| file_name.strip_suffix(".fna.gz")).or_else(|| file_name.strip_suffix(".fna"))
-        .unwrap_or(file_name)
+    }
+}
+
+// 旧式 ID 形式：剥离已知基因组文件扩展名（.fasta/.fa/.fna 及其 .gz 变体）。
+// 仅用于 taxonomy 查询的兼容回退（taxonomy 文件的键历史上不带扩展名）。
+fn strip_genome_extension(id: &str) -> Option<&str> {
+    id.strip_suffix(".fasta.gz").or_else(|| id.strip_suffix(".fasta"))
+        .or_else(|| id.strip_suffix(".fa.gz")).or_else(|| id.strip_suffix(".fa"))
+        .or_else(|| id.strip_suffix(".fna.gz")).or_else(|| id.strip_suffix(".fna"))
 }
 
 // 从db文件中读取基因组映射关系
@@ -2024,11 +2019,8 @@ fn read_genome_mapping(db_path: &str) -> Result<FxHashMap<String, (String, Strin
                 .file_name()
                 .and_then(|s| s.to_str()) 
             {
-                // 移除.fasta.gz或.fasta扩展名
-                file_name.strip_suffix(".fasta.gz")
-                    .or_else(|| file_name.strip_suffix(".fasta"))
-                    .unwrap_or(file_name)
-                    .to_string()
+                // 基因组 ID 与输入文件名逐字一致（不剥离扩展名）
+                file_name.to_string()
             } else {
                 genome_source.clone()
             };
@@ -2210,11 +2202,8 @@ fn build_genome_mapping_from_cache(cached_db_entries: &[SyldbEntry]) -> FxHashMa
             .file_name()
             .and_then(|s| s.to_str()) 
         {
-            // 移除.fasta.gz或.fasta扩展名
-            file_name.strip_suffix(".fasta.gz")
-                .or_else(|| file_name.strip_suffix(".fasta"))
-                .unwrap_or(file_name)
-                .to_string()
+            // 基因组 ID 与输入文件名逐字一致（不剥离扩展名）
+            file_name.to_string()
         } else {
             genome_source.clone()
         };
@@ -3225,7 +3214,7 @@ mod tests {
         );
         let b = protected
             .iter()
-            .find(|r| r.genome_file == "B")
+            .find(|r| r.genome_file == "B.fasta")
             .expect("near-annihilated genome B (4% survival) should be protected");
         assert_eq!(
             b.adjusted_ani, 99.0,
@@ -3240,15 +3229,15 @@ mod tests {
             "protected genome uses post-reassignment coverage for abundance"
         );
         assert!(
-            protected.iter().any(|r| r.genome_file == "A"),
+            protected.iter().any(|r| r.genome_file == "A.fasta"),
             "winner A still reported"
         );
         assert!(
-            !protected.iter().any(|r| r.genome_file == "C"),
+            !protected.iter().any(|r| r.genome_file == "C.fasta"),
             "ordinary cluster loser C (60% loss, 40% survival) must NOT be protected"
         );
         assert!(
-            !protected.iter().any(|r| r.genome_file == "D"),
+            !protected.iter().any(|r| r.genome_file == "D.fasta"),
             "genome D with weak initial evidence (60 < 100 initial shared) must NOT be protected"
         );
 
@@ -3269,12 +3258,12 @@ mod tests {
             false,
         );
         assert!(
-            !unprotected.iter().any(|r| r.genome_file == "B"),
+            !unprotected.iter().any(|r| r.genome_file == "B.fasta"),
             "without protection B is stripped below the floor and dropped"
         );
-        assert!(!unprotected.iter().any(|r| r.genome_file == "C"));
-        assert!(!unprotected.iter().any(|r| r.genome_file == "D"));
-        assert!(unprotected.iter().any(|r| r.genome_file == "A"));
+        assert!(!unprotected.iter().any(|r| r.genome_file == "C.fasta"));
+        assert!(!unprotected.iter().any(|r| r.genome_file == "D.fasta"));
+        assert!(unprotected.iter().any(|r| r.genome_file == "A.fasta"));
 
         // 防膨胀护栏：初始 ANI 低于 min_ani 的基因组即使被近全灭也不受保护。
         let mut low_ani_initial = initial.clone();
@@ -3297,7 +3286,7 @@ mod tests {
             true,
         );
         assert!(
-            !guarded.iter().any(|r| r.genome_file == "B"),
+            !guarded.iter().any(|r| r.genome_file == "B.fasta"),
             "genome failing min-ani on pre-reassignment stats must not be protected"
         );
     }
