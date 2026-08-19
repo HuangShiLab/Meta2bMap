@@ -1,10 +1,10 @@
 [package]
-name = "meta2bseek"
+name = "meta2bmap"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Coverage-adjusted ANI queries and taxonomic profiling for 2bRAD and shotgun metagenomic data"
-repository = "https://github.com/HuangShiLab/meta2bseek"
+repository = "https://github.com/HuangShiLab/meta2bmap"
 
 [dependencies]
 flate2 = "1.0"       # Add this

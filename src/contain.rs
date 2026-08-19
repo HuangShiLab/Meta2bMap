@@ -978,7 +978,7 @@ fn ratio_lambda(full_covs: &[u32], min_count_correct: f64) -> Option<f64> {
 }
 
 /// sylph 的覆盖度校正 ANI：用零截断泊松的检出概率 (1 - e^-lambda) 还原因低覆盖
-/// 而漏掉的 tag，再映射回 ANI。这是 meta2bseek 之前缺失、导致大量假阴性的核心。
+/// 而漏掉的 tag，再映射回 ANI。这是 meta2bmap 之前缺失、导致大量假阴性的核心。
 fn ani_from_lambda(lambda: f64, k: f64, full_covs: &[u32]) -> Option<f64> {
     if full_covs.is_empty() { return None; }
     let contain_count = full_covs.iter().filter(|&&x| x != 0).count() as f64;

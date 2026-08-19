@@ -631,7 +631,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "meta2bseek"
+name = "meta2bmap"
 version = "0.1.0"
 dependencies = [
  "anyhow",

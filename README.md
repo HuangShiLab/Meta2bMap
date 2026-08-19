@@ -1,8 +1,8 @@
-# meta2bseek
+# meta2bmap
 
 **Ultrafast coverage-adjusted ANI queries and taxonomic profiling for 2bRAD and shotgun metagenomic data.**
 
-meta2bseek is a Rust command-line tool that profiles metagenomic samples by matching
+meta2bmap is a Rust command-line tool that profiles metagenomic samples by matching
 restriction-enzyme (2bRAD) tags extracted from sequencing reads against tags extracted
 from reference genomes. It reports per-genome containment ANI with a coverage-adjustment
 model (a negative-binomial per-locus model that corrects the naive containment ANI at low
@@ -11,19 +11,19 @@ coverage), together with taxonomic and sequence abundances.
 It works on two kinds of data:
 
 - **2bRAD / type-IIB restriction-enzyme data** — reads are (or contain) enzyme tags;
-  meta2bseek extracts the tags directly.
+  meta2bmap extracts the tags directly.
 - **Shotgun data** — the same enzyme-tag scheme is applied in silico to shotgun reads,
   yielding a sparse but fast marker set.
 
-meta2bseek is part of the 2bRAD software family (with Fast2bRAD-M and Strain2bScan) and is
+meta2bmap is part of the 2bRAD software family (with Fast2bRAD-M and Strain2bScan) and is
 a derivative of [sylph](https://github.com/bluenote-1577/sylph) (see
 [Relationship to sylph](#relationship-to-sylph) below).
 
-Repository: <https://github.com/HuangShiLab/meta2bseek>
+Repository: <https://github.com/HuangShiLab/meta2bmap>
 
 ## Installation
 
-meta2bseek is built from source with the Rust toolchain (Rust 1.70+).
+meta2bmap is built from source with the Rust toolchain (Rust 1.70+).
 
 ### Supported platforms
 
@@ -50,18 +50,18 @@ sudo yum groupinstall "Development Tools" && sudo yum install curl
 ### Build
 
 ```bash
-git clone https://github.com/HuangShiLab/meta2bseek.git
-cd meta2bseek
+git clone https://github.com/HuangShiLab/meta2bmap.git
+cd meta2bmap
 cargo build --release
 ```
 
-The binary is produced at `target/release/meta2bseek`.
+The binary is produced at `target/release/meta2bmap`.
 
 ## Quickstart
 
 ```bash
 # 1. Extract 2bRAD tags from reference genomes AND a sample (one command)
-meta2bseek extract -t 8 \
+meta2bmap extract -t 8 \
   -g genome1.fa genome2.fa \
   -r sample.fq \
   -o out -d out -n myrun -e BcgI
@@ -70,7 +70,7 @@ meta2bseek extract -t 8 \
 # -> out/myrun.sylsp  (sample tags)
 
 # 2. Profile: species-level abundances + coverage-adjusted ANI
-meta2bseek profile \
+meta2bmap profile \
   --db-file out/myrun.syldb \
   --sample-file out/myrun.sylsp \
   --minimum-ani 90 \
@@ -86,10 +86,10 @@ Other useful `extract` input modes:
 
 ```bash
 # paired-end reads
-meta2bseek extract -t 8 -1 a_1.fq b_1.fq -2 a_2.fq b_2.fq -d out -n paired
+meta2bmap extract -t 8 -1 a_1.fq b_1.fq -2 a_2.fq b_2.fq -d out -n paired
 
 # batch mode from list files
-meta2bseek extract -t 8 -k genome_list.txt -s reads_list.txt -o out -d out -n batch
+meta2bmap extract -t 8 -k genome_list.txt -s reads_list.txt -o out -d out -n batch
 ```
 
 `-k/--genome-list` accepts a two-column TSV (`genome_id<TAB>fasta_path`) or one path per
@@ -113,7 +113,7 @@ Useful `extract` options:
 | `view`     | View sketched `.db`/`.sp` files produced by `sketch` |
 | `mark`     | Mark unique (taxa-specific) tags in a `.syldb` file |
 
-Run `meta2bseek <subcommand> -h` for the full option list.
+Run `meta2bmap <subcommand> -h` for the full option list.
 
 ### Key `profile` options
 
@@ -133,7 +133,7 @@ Run `meta2bseek <subcommand> -h` for the full option list.
   lower values increase sensitivity on large dense databases).
 
 `query` takes pre-extracted files as positional arguments
-(`meta2bseek query *.syldb *.sylsp > results.tsv`) and shares most algorithm options;
+(`meta2bmap query *.syldb *.sylsp > results.tsv`) and shares most algorithm options;
 its output header includes `ANI(%)`, `Eff_cov`, `ANI_5-95%`, `Median_cov`, `Mean_cov`,
 `Containment`, and `Naive_ANI` per genome–sample pair.
 
@@ -158,8 +158,8 @@ the same abundance estimates in TSV form.
 `-e/--enzyme` accepts a single enzyme name, a comma-separated list, or `all`:
 
 ```bash
-meta2bseek extract -t 8 -g refs/*.fa -r sample.fq -o out -d out -n multi -e BcgI,BslFI,CspCI,AloI
-meta2bseek extract -t 8 -g refs/*.fa -r sample.fq -o out -d out -n all16  -e all
+meta2bmap extract -t 8 -g refs/*.fa -r sample.fq -o out -d out -n multi -e BcgI,BslFI,CspCI,AloI
+meta2bmap extract -t 8 -g refs/*.fa -r sample.fq -o out -d out -n all16  -e all
 ```
 
 16 type-IIB enzymes are built in, with tag lengths stored per tag in the database:
@@ -181,14 +181,14 @@ produced by older builds.**
 
 ## Relationship to sylph
 
-meta2bseek is a derivative work of [sylph](https://github.com/bluenote-1577/sylph) by
+meta2bmap is a derivative work of [sylph](https://github.com/bluenote-1577/sylph) by
 Jim Shaw, reusing its containment-ANI framework and parts of its code (e.g. the AVX2
 k-mer hashing), with modifications by the HuangShi Lab for restriction-enzyme tag
 extraction, multi-enzyme joint ANI, and the coverage-adjustment model. sylph is
-distributed under the MIT license; meta2bseek preserves sylph's copyright notice and
-license terms in [LICENSE](LICENSE). If you use meta2bseek, please also credit sylph.
+distributed under the MIT license; meta2bmap preserves sylph's copyright notice and
+license terms in [LICENSE](LICENSE). If you use meta2bmap, please also credit sylph.
 
 ## Citation
 
-A manuscript describing meta2bseek is in preparation. Until then, please cite this
+A manuscript describing meta2bmap is in preparation. Until then, please cite this
 repository and the sylph paper (Shaw & Yu, *Nature Biotechnology*, 2024).

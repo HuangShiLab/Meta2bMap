@@ -1,10 +1,10 @@
-# Meta2bSeek — Agent Guide
+# Meta2bMap — Agent Guide
 
-This guide is intended for AI coding agents that need to work on the Meta2bSeek codebase. It assumes no prior knowledge of the project.
+This guide is intended for AI coding agents that need to work on the Meta2bMap codebase. It assumes no prior knowledge of the project.
 
 ## Project Overview
 
-Meta2bSeek is a Rust command-line tool for **ultrafast genome ANI queries and taxonomic profiling of metagenomic shotgun samples**. It is built around two main ideas:
+Meta2bMap is a Rust command-line tool for **ultrafast genome ANI queries and taxonomic profiling of metagenomic shotgun samples**. It is built around two main ideas:
 
 1. **2bRAD tag extraction**: restriction-enzyme-based extraction of short tags from reference genomes and sequencing reads.
 2. **k-mer sketching**: a sylph-style sampled k-mer mode for ANI estimation.
@@ -15,7 +15,7 @@ The tool currently supports three categories of analysis (as described in `READM
 - strain and functional profiling;
 - statistical analysis of containment/ANI results.
 
-The repository is located at `/Users/macstudio/meta2bseek`. It is a single Cargo workspace with one binary crate (`meta2bseek`).
+The repository is located at `/Users/macstudio/meta2bmap`. It is a single Cargo workspace with one binary crate (`meta2bmap`).
 
 ## Technology Stack
 
@@ -39,14 +39,14 @@ The repository is located at `/Users/macstudio/meta2bseek`. It is a single Cargo
 Build the release binary:
 
 ```bash
-cd /Users/macstudio/meta2bseek
+cd /Users/macstudio/meta2bmap
 cargo build --release
 ```
 
 The binary is produced at:
 
 ```
-target/release/meta2bseek
+target/release/meta2bmap
 ```
 
 Build for development (includes debug symbols; release profile also sets `debug = true`):
@@ -74,7 +74,7 @@ Current test coverage is modest: unit tests live in `#[cfg(test)] mod tests` blo
 | `query`    | `contain` | Coverage-adjusted ANI querying between databases and samples. |
 | `profile`  | `contain` | Species-level taxonomic profiling with abundances and ANIs. |
 | `inspect`  | `inspect` | Inspect extracted `.db`/`.sp` files. |
-| `view`     | `view`    | View sketched `.db`/`.sp` files (Meta2bSeek sketch format). |
+| `view`     | `view`    | View sketched `.db`/`.sp` files (Meta2bMap sketch format). |
 | `mark`     | `mark`    | Mark taxa-specific (unique) tags in a `.db` file. |
 
 `src/lib.rs` re-exports the public modules and the CLI struct. The crate is therefore usable both as a binary and as a library, although the public API surface is currently whatever `lib.rs` exposes.
@@ -102,7 +102,7 @@ Current test coverage is modest: unit tests live in `#[cfg(test)] mod tests` blo
 ## Code Organization
 
 ```
-meta2bseek/
+meta2bmap/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── README.md
@@ -157,16 +157,16 @@ Example end-to-end smoke test after a build:
 
 ```bash
 # Extract tags from a genome FASTA
-./target/release/meta2bseek extract -g genome.fa -o ./out --out-name ref_db
+./target/release/meta2bmap extract -g genome.fa -o ./out --out-name ref_db
 
 # Extract tags from a sample FASTQ
-./target/release/meta2bseek extract -s sample_list.txt -d ./out --out-name sample
+./target/release/meta2bmap extract -s sample_list.txt -d ./out --out-name sample
 
 # Query
-./target/release/meta2bseek query out/ref_db.db out/sample.sp > results.tsv
+./target/release/meta2bmap query out/ref_db.db out/sample.sp > results.tsv
 
 # Profile
-./target/release/meta2bseek profile --sample-file out/sample.sp --db-file out/ref_db.db --threads 4
+./target/release/meta2bmap profile --sample-file out/sample.sp --db-file out/ref_db.db --threads 4
 ```
 
 ## Security Considerations

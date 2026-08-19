@@ -407,7 +407,7 @@ fn check_args_valid(args: &SketchArgs) -> Result<()> {
         && args.list_sequence.is_none()
         && args.files.is_empty()
     {
-        return Err(anyhow!("No input sequences found; see meta2bseek sketch -h for help"));
+        return Err(anyhow!("No input sequences found; see meta2bmap sketch -h for help"));
     }
 
     if args.fpr < 0. || args.fpr >= 1. {
@@ -1338,7 +1338,7 @@ mod tests {
 
     fn write_temp_fasta(tag: &str, seq: &str) -> String {
         let path = std::env::temp_dir().join(format!(
-            "meta2bseek_sketch_test_{}_{}.fa",
+            "meta2bmap_sketch_test_{}_{}.fa",
             std::process::id(),
             tag
         ));
