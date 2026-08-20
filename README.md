@@ -19,7 +19,7 @@ meta2bmap is part of the 2bRAD software family (with Fast2bRAD-M and Strain2bSca
 a derivative of [sylph](https://github.com/bluenote-1577/sylph) (see
 [Relationship to sylph](#relationship-to-sylph) below).
 
-Repository: <https://github.com/HuangShiLab/meta2bmap>
+Repository: <https://github.com/HuangShiLab/Meta2bMap>
 
 ## Installation
 
@@ -50,8 +50,8 @@ sudo yum groupinstall "Development Tools" && sudo yum install curl
 ### Build
 
 ```bash
-git clone https://github.com/HuangShiLab/meta2bmap.git
-cd meta2bmap
+git clone https://github.com/HuangShiLab/Meta2bMap.git
+cd Meta2bMap
 cargo build --release
 ```
 
@@ -100,12 +100,29 @@ Useful `extract` options:
 
 - `--no-tag-seqs`: do not store tag sequences in the `.syldb` (saves ~4-5x memory/disk
   for large databases; `--mismatch 1` will be unavailable for that database).
+- `--max-ram <GB>`: cap RAM usage (default: 75% of total system memory; the extractor
+  throttles itself to stay under this limit).
+
+## Large databases: chunked build + merge
+
+For very large reference collections, build per-chunk databases in parallel and merge
+them (all chunks must use the same enzyme set):
+
+```bash
+meta2bmap extract -t 16 -k chunk1_list.txt -o chunk1 -d chunk1 -n chunk1 -e CjeI,BslFI
+meta2bmap extract -t 16 -k chunk2_list.txt -o chunk2 -d chunk2 -n chunk2 -e CjeI,BslFI
+meta2bmap merge chunk1/chunk1.syldb chunk2/chunk2.syldb -o full.syldb
+```
+
+`merge` refuses to combine databases built with different enzyme sets and warns if tag
+sequences are stored inconsistently across inputs.
 
 ## Subcommands
 
 | Subcommand | Purpose |
 |------------|---------|
 | `extract`  | Extract enzyme tags from FASTA genomes / FASTQ reads into `.syldb` / `.sylsp` |
+| `merge`    | Merge multiple `.syldb` chunk files into one database (for parallel batch builds) |
 | `profile`  | Species-level taxonomic profiling with abundances and coverage-adjusted ANI |
 | `query`    | Coverage-adjusted containment-ANI queries between databases and samples |
 | `sketch`   | sylph-style k-mer sampling sketching (alternative to tag extraction) |
@@ -131,6 +148,19 @@ Run `meta2bmap <subcommand> -h` for the full option list.
   no filter).
 - `--min-shared-tags <N>`: minimum shared tags required to report a genome (default 100;
   lower values increase sensitivity on large dense databases).
+- `--min-tags-genome <N>`: exclude genomes with fewer than N matched tags up front
+  (default 50).
+- `--sketch-mode`: treat `--db-file`/`--sample-file` as k-mer sketches (`.db`/`.sp`)
+  produced by `sketch` instead of 2bRAD tag files, and run them through the same
+  containment/ANI engine (requires `--mismatch 0`).
+- `--read-error-rate <F>` / `--no-error-correction`: in `--mismatch 1` mode, override or
+  disable the error-aware ANI inversion (by default the per-base read error rate is
+  estimated from the top candidate genomes).
+- `--allow-enzyme-mismatch`: proceed even if the sample was extracted with a different
+  enzyme set than the database (default: hard error).
+- `--reassign-protection`: opt-in guard against winner-take-all over-stripping (default
+  OFF; on large dense databases it rescues strain-cluster losers alongside true
+  positives, so it costs precision).
 
 `query` takes pre-extracted files as positional arguments
 (`meta2bmap query *.syldb *.sylsp > results.tsv`) and shares most algorithm options;
@@ -152,6 +182,24 @@ The genome composition table (stdout) has one row per detected genome:
 
 The abundance matrix written to `--tsv-name` contains one row per genome × sample with
 the same abundance estimates in TSV form.
+
+## k-mer sketch mode (shotgun)
+
+As an alternative to enzyme tags, `sketch` builds sylph-style sampled k-mer sketches
+(`.db` / `.sp`), which `profile --sketch-mode` and `query --sketch-mode` run through the
+same containment / coverage-adjusted ANI engine:
+
+```bash
+meta2bmap sketch -t 8 -g refs/*.fa -o out --db-out-name refdb
+meta2bmap sketch -t 8 -r sample.fq -d out
+meta2bmap profile --sketch-mode --db-file out/refdb.db \
+  --sample-file out/sample.sp --minimum-ani 90 --threads 8
+```
+
+Key `sketch` options: `-c/--c-value` subsampling rate (default 200), `--k-size`
+(default 31), `--min-spacing` between selected k-mers (default 30). For benchmarking
+against sylph, `sketch --sylph-faithful` builds sylph-equivalent sketches (deduplicate
+repeated genomic k-mers instead of deleting them, and force `--min-spacing 0`).
 
 ## Multi-enzyme usage
 

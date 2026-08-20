@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Coverage-adjusted ANI queries and taxonomic profiling for 2bRAD and shotgun metagenomic data"
-repository = "https://github.com/HuangShiLab/meta2bmap"
+repository = "https://github.com/HuangShiLab/Meta2bMap"
 
 [dependencies]
 flate2 = "1.0"       # Add this

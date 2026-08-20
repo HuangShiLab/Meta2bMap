@@ -70,6 +70,7 @@ Current test coverage is modest: unit tests live in `#[cfg(test)] mod tests` blo
 | Subcommand | Module | Purpose |
 |------------|--------|---------|
 | `extract`  | `extract` | Extract 2bRAD tags from FASTA/FASTQ into `.db` (genomes) or `.sp`/`.sylsp` (samples). |
+| `merge`    | `merge`   | Merge multiple `.syldb` chunk files into one database (for parallel batch builds; refuses mixed enzyme sets). |
 | `sketch`   | `sketch`  | Build k-mer sketches using sylph-style sampling into `.db`/`.sp`. |
 | `query`    | `contain` | Coverage-adjusted ANI querying between databases and samples. |
 | `profile`  | `contain` | Species-level taxonomic profiling with abundances and ANIs. |
