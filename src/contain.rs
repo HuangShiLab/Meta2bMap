@@ -328,82 +328,92 @@ fn recalculate_one_sample_with_winner_table(
     mismatch: usize,
     min_shared_tags: usize,
     min_tags_genome: usize,
-    read_error_rate: Option<f64>,
-    no_error_correction: bool,
+    error_rate: f64, // 与初始 pass 输入相同，由编排层算好一次下传
+    neighbor_cache: Option<&MismatchNeighborCache>,
     initial_by_contig: &FxHashMap<&str, &QueryResult>,
     reassign_protection: bool,
 ) -> Vec<QueryResult> {
-    let error_rate = sample_error_rate(
-        db_entries,
-        sample_counts,
-        mismatch,
-        read_error_rate,
-        no_error_correction,
-    );
-    let mut results = Vec::new();
+    // 为每个基因组（已聚合）计算重新分配后的结果。
+    // 只处理初始 pass 已命中的基因组：重分配只会把 tag 从基因组中剔除
+    // （winner_map 把共享 tag 判给赢家，基因组不会新增覆盖），统计量相对初始 pass
+    // 单调不增；相同的 filter_results_for_profile 阈值下，初始未命中的基因组重分配后
+    // 也不可能通过。reassign_protection 路径同样只查 initial_by_contig，不受影响。
+    // par_iter 对切片是 indexed iterator，collect 保持与串行一致的 db_entries 顺序。
+    db_entries
+        .par_iter()
+        .enumerate()
+        .filter_map(|(entry_idx, db_entry)| {
+            // 最小标签数过滤
+            if db_entry.tags.len() < min_tags_genome {
+                return None;
+            }
+            if !initial_by_contig.contains_key(db_entry.sequence_id.as_str()) {
+                return None;
+            }
 
-    // 为每个基因组（已聚合）计算重新分配后的结果
-    for db_entry in db_entries {
-        // 最小标签数过滤
-        if db_entry.tags.len() < min_tags_genome {
-            continue;
-        }
+            let genome_id = extract_genome_id_from_path(&db_entry.genome_source);
+            // 当前基因组在 winner table 中的索引（若从未赢得任何 tag 则为 None）
+            let my_idx = interner.get(genome_id);
+            let mut covs: Vec<u32> = Vec::new();
+            let mut tags_lost_count = 0;
 
-        let genome_id = extract_genome_id_from_path(&db_entry.genome_source);
-        // 当前基因组在 winner table 中的索引（若从未赢得任何 tag 则为 None）
-        let my_idx = interner.get(genome_id);
-        let mut covs: Vec<u32> = Vec::new();
-        let mut tags_lost_count = 0;
-
-        // 只统计被 winner table 判给当前基因组的 tag 的覆盖度
-        for (i, tag) in db_entry.tags.iter().enumerate() {
-            let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-            let c = match lookup_tag_coverage(*tag, seq, sample_counts, mismatch) {
-                Some(c) if c > 0 => c,
-                _ => continue,
-            };
-            // winner table 目前基于 exact tag hash 构建；mismatch 命中时若 exact hash 不在 winner_map 中，
-            // 则保守地视为归属于当前基因组（不扣除），避免过度惩罚真实但带 1 mismatch 的 tag。
-            match winner_map.get(tag) {
-                Some(winner_entry) if Some(winner_entry.genome_idx) != my_idx => {
-                    tags_lost_count += 1; // 该 tag 被分配给了其他基因组
-                }
-                _ => {
-                    covs.push(c); // 归当前基因组所有
+            // 只统计被 winner table 判给当前基因组的 tag 的覆盖度
+            for (i, tag) in db_entry.tags.iter().enumerate() {
+                let c = match if let Some(cache) = neighbor_cache {
+                    lookup_tag_coverage(*tag, cache.get(entry_idx, i), sample_counts, mismatch)
+                } else {
+                    // 无缓存路径（sketch 模式等）：保持原来的现算行为
+                    let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                    lookup_tag_coverage_regen(*tag, seq, sample_counts, mismatch)
+                } {
+                    Some(c) if c > 0 => c,
+                    _ => continue,
+                };
+                // winner table 目前基于 exact tag hash 构建；mismatch 命中时若 exact hash 不在 winner_map 中，
+                // 则保守地视为归属于当前基因组（不扣除），避免过度惩罚真实但带 1 mismatch 的 tag。
+                match winner_map.get(tag) {
+                    Some(winner_entry) if Some(winner_entry.genome_idx) != my_idx => {
+                        tags_lost_count += 1; // 该 tag 被分配给了其他基因组
+                    }
+                    _ => {
+                        covs.push(c); // 归当前基因组所有
+                    }
                 }
             }
-        }
 
-        let total_ref_tags = db_entry.tags.len();
+            let total_ref_tags = db_entry.tags.len();
 
-        if log_reassign && tags_lost_count > 0 {
-            eprintln!(
-                "Genome {} in sample {}: owned_tags={}, lost_tags={}, total_ref_tags={}",
-                genome_id,
-                sample_source,
-                covs.len(),
-                tags_lost_count,
-                total_ref_tags
+            if log_reassign && tags_lost_count > 0 {
+                eprintln!(
+                    "Genome {} in sample {}: owned_tags={}, lost_tags={}, total_ref_tags={}",
+                    genome_id,
+                    sample_source,
+                    covs.len(),
+                    tags_lost_count,
+                    total_ref_tags
+                );
+            }
+
+            // 覆盖度校正后的统计
+            let mut result = calculate_statistics(
+                covs,
+                &db_entry.tag_lengths,
+                total_sample_tags,
+                total_ref_tags,
+                mismatch,
+                error_rate,
             );
-        }
+            result.sample_file = sample_source.to_string();
+            result.genome_file = genome_id.to_string();
+            result.contig_name = db_entry.sequence_id.clone();
 
-        // 覆盖度校正后的统计
-        let mut result = calculate_statistics(
-            covs,
-            &db_entry.tag_lengths,
-            total_sample_tags,
-            total_ref_tags,
-            mismatch,
-            error_rate,
-        );
-        result.sample_file = sample_source.to_string();
-        result.genome_file = genome_id.to_string();
-        result.contig_name = db_entry.sequence_id.clone();
-
-        // 应用profile专用的过滤条件
-        if filter_results_for_profile(&result, Some(min_ani), min_shared_tags, min_tags_genome) {
-            results.push(result);
-        } else if reassign_protection {
+            // 应用profile专用的过滤条件
+            if filter_results_for_profile(&result, Some(min_ani), min_shared_tags, min_tags_genome) {
+                return Some(result);
+            }
+            if !reassign_protection {
+                return None;
+            }
             // 过度剥离保护：winner-take-all 在密集多酶库上会把近缘菌株的整个 tag 集判给
             // 赢家，导致输家 post-reassignment ANI/shared_tags 崩塌并被 min-ani 过滤掉
             // （此时 filter_over_reassigned_genomes 根本来不及触发）。触发条件（v2，
@@ -447,13 +457,12 @@ fn recalculate_one_sample_with_winner_table(
                         genome_id, sample_source, result.shared_tags, initial_shared,
                         survival_frac * 100.0, protected.adjusted_ani, protected.eff_cov
                     );
-                    results.push(protected);
+                    return Some(protected);
                 }
             }
-        }
-    }
-
-    results
+            None
+        })
+        .collect()
 }
 
 // 使用winner table重新计算统计结果 - 模仿sylph的get_stats函数
@@ -471,8 +480,8 @@ fn recalculate_with_winner_table(
     mismatch: usize,
     min_shared_tags: usize,
     min_tags_genome: usize,
-    read_error_rate: Option<f64>,
-    no_error_correction: bool,
+    error_rates: &FxHashMap<String, f64>, // 每个样本源一次，由编排层算好下传
+    neighbor_cache: Option<&MismatchNeighborCache>,
     initial_results: &[QueryResult],
     reassign_protection: bool,
 ) -> Vec<QueryResult> {
@@ -504,6 +513,7 @@ fn recalculate_with_winner_table(
     for (sample_source, group_entries) in sample_groups {
         let sample_counts = sample_tag_counts_ref(&group_entries);
         let total_sample_tags = group_entries.len();
+        let error_rate = error_rates.get(&sample_source).copied().unwrap_or(0.0);
         let mut results = recalculate_one_sample_with_winner_table(
             &sample_source,
             &sample_counts,
@@ -516,8 +526,8 @@ fn recalculate_with_winner_table(
             mismatch,
             min_shared_tags,
             min_tags_genome,
-            read_error_rate,
-            no_error_correction,
+            error_rate,
+            neighbor_cache,
             &initial_by_contig,
             reassign_protection,
         );
@@ -804,6 +814,7 @@ pub fn query(args: ContainArgs) -> Result<()> {
                             args.mismatch,
                             args.read_error_rate,
                             args.no_error_correction,
+                            None,
                         );
 
                         // 对每个基因组进行比对
@@ -814,7 +825,7 @@ pub fn query(args: ContainArgs) -> Result<()> {
                                 .enumerate()
                                 .filter_map(|(i, t)| {
                                     let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                                    lookup_tag_coverage(*t, seq, sample_counts, args.mismatch)
+                                    lookup_tag_coverage_regen(*t, seq, sample_counts, args.mismatch)
                                 })
                                 .collect();
 
@@ -874,6 +885,7 @@ pub fn query(args: ContainArgs) -> Result<()> {
                     args.mismatch,
                     args.read_error_rate,
                     args.no_error_correction,
+                    None,
                 );
 
                 // 对每个基因组进行比对
@@ -885,7 +897,7 @@ pub fn query(args: ContainArgs) -> Result<()> {
                         .enumerate()
                         .filter_map(|(i, t)| {
                             let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                            lookup_tag_coverage(*t, seq, &sample_counts, args.mismatch)
+                            lookup_tag_coverage_regen(*t, seq, &sample_counts, args.mismatch)
                         })
                         .collect();
 
@@ -1370,12 +1382,76 @@ fn sample_tag_counts_ref(sample_entries: &[&SylspEntry]) -> FxHashMap<Hash, u32>
     counts
 }
 
+// ---- mm1 邻居哈希缓存（profile 热路径） ----
+
+/// 预计算的 1-mismatch 邻居哈希缓存，与聚合后的 db_entries 逐条对齐。
+/// 纯内存侧结构（不序列化）：mm1 下每次 lookup 都重新生成 ~3ℓ 个 canonical 邻居
+/// 哈希（重新 canonicalize + FNV）是主要开销，这里在样本处理前一次性并行算好。
+struct MismatchNeighborCache {
+    entries: Vec<EntryNeighbors>,
+}
+
+/// 单个 db entry 的邻居缓存：扁平哈希数组 + 每个 tag 的起止偏移（cache-friendly）。
+/// `offsets` 为空表示该 entry 没有 tag 序列（旧 DB），mm1 查询保持 exact-only。
+struct EntryNeighbors {
+    hashes: Vec<Hash>,
+    offsets: Vec<u32>, // len == tags.len() + 1
+}
+
+impl MismatchNeighborCache {
+    /// 并行构建缓存；entry 缺 tag_seqs 时记为空（保持旧 DB 的 exact-only 语义）。
+    fn build(db_entries: &[SyldbEntry]) -> Self {
+        let entries: Vec<EntryNeighbors> = db_entries
+            .par_iter()
+            .map(|entry| {
+                let mut hashes = Vec::new();
+                let mut offsets = Vec::new();
+                if let Some(seqs) = &entry.tag_seqs {
+                    offsets.reserve(entry.tags.len() + 1);
+                    offsets.push(0u32);
+                    for i in 0..entry.tags.len() {
+                        if let Some(seq) = seqs.get(i) {
+                            hashes.extend(one_mismatch_canonical_hashes(seq));
+                        }
+                        offsets.push(hashes.len() as u32);
+                    }
+                }
+                EntryNeighbors { hashes, offsets }
+            })
+            .collect();
+        let total_tags: usize = db_entries.iter().map(|e| e.tags.len()).sum();
+        let total_hashes: usize = entries.iter().map(|e| e.hashes.len()).sum();
+        let approx_mb = (total_hashes * std::mem::size_of::<Hash>()
+            + entries.iter().map(|e| e.offsets.len() * 4).sum::<usize>()) as f64
+            / 1e6;
+        eprintln!(
+            "Built 1-mismatch neighbor cache: {} tags, {} neighbor hashes (~{:.1} MB)",
+            total_tags, total_hashes, approx_mb
+        );
+        MismatchNeighborCache { entries }
+    }
+
+    /// 取 (entry_idx, tag_idx) 的预计算邻居；无序列信息时返回 None（exact-only）。
+    /// 邻居顺序与 one_mismatch_canonical_hashes 的输出完全一致。
+    #[inline]
+    fn get(&self, entry_idx: usize, tag_idx: usize) -> Option<&[Hash]> {
+        let entry = self.entries.get(entry_idx)?;
+        if entry.offsets.is_empty() {
+            return None;
+        }
+        let start = *entry.offsets.get(tag_idx)? as usize;
+        let end = *entry.offsets.get(tag_idx + 1)? as usize;
+        Some(&entry.hashes[start..end])
+    }
+}
+
 /// 查询一个参考 tag 在样本中的覆盖度。`mismatch=0` 时精确匹配；`mismatch=1` 时额外检查
-/// 该参考 tag 的所有 canonical 1-mismatch 邻居。优先返回 exact match 的计数，若不存在则
+/// 该参考 tag 的所有 canonical 1-mismatch 邻居（`neighbor_hashes`，通常来自
+/// `MismatchNeighborCache`）。优先返回 exact match 的计数，若不存在则
 /// 返回第一个命中的 neighbor 计数（避免同一参考 tag 被多个样本 tag 重复计数）。
 fn lookup_tag_coverage(
     tag_hash: Hash,
-    tag_seq: Option<&TagHash>,
+    neighbor_hashes: Option<&[Hash]>,
     sample_counts: &FxHashMap<Hash, u32>,
     mismatch: usize,
 ) -> Option<u32> {
@@ -1387,8 +1463,7 @@ fn lookup_tag_coverage(
     if mismatch == 0 {
         return None;
     }
-    let seq = tag_seq?;
-    for neighbor_hash in one_mismatch_canonical_hashes(seq) {
+    for &neighbor_hash in neighbor_hashes? {
         if let Some(&c) = sample_counts.get(&neighbor_hash) {
             if c > 0 {
                 return Some(c);
@@ -1396,6 +1471,26 @@ fn lookup_tag_coverage(
         }
     }
     None
+}
+
+/// 无预计算缓存时的便捷封装（query 等低频路径）：exact 未命中且 mismatch>0 时才
+/// 现算 1-mismatch 邻居，语义与先预生成再查表完全一致。
+fn lookup_tag_coverage_regen(
+    tag_hash: Hash,
+    tag_seq: Option<&TagHash>,
+    sample_counts: &FxHashMap<Hash, u32>,
+    mismatch: usize,
+) -> Option<u32> {
+    if mismatch == 0 {
+        return lookup_tag_coverage(tag_hash, None, sample_counts, mismatch);
+    }
+    match sample_counts.get(&tag_hash) {
+        Some(&c) if c > 0 => Some(c),
+        _ => {
+            let neighbors = one_mismatch_canonical_hashes(tag_seq?);
+            lookup_tag_coverage(tag_hash, Some(&neighbors), sample_counts, mismatch)
+        }
+    }
 }
 
 // ---- read error rate 估计（--mismatch 1 的 error-aware ANI 反推） ----
@@ -1448,21 +1543,31 @@ fn pooled_error_rate(classes: &FxHashMap<u8, (u64, u64)>) -> Option<f64> {
 /// 若无，退到 exact containment 最高的前 ERROR_EST_TOP_N 个。对这些基因组统计每个参考
 /// tag 是 exact 命中还是 mm1-only 命中，交给 `pooled_error_rate`。
 /// 估计不可行（无候选 / tag 太少）时返回 0.0 并打日志 —— 即退化为旧的未校正行为。
-fn estimate_read_error_rate(db_entries: &[SyldbEntry], sample_counts: &FxHashMap<Hash, u32>) -> f64 {
+fn estimate_read_error_rate(
+    db_entries: &[SyldbEntry],
+    sample_counts: &FxHashMap<Hash, u32>,
+    neighbor_cache: Option<&MismatchNeighborCache>,
+) -> f64 {
     // 第一遍：计算每个基因组的 exact containment 与 mm0-ANI（按主导长度类）。
-    let mut scored: Vec<(f64, &SyldbEntry)> = Vec::new(); // (exact containment, entry)
-    for db_entry in db_entries {
-        if db_entry.tags.is_empty() || db_entry.tag_seqs.is_none() {
-            continue;
-        }
-        let n_exact = db_entry.tags.iter()
-            .filter(|t| sample_counts.get(*t).map_or(false, |&c| c > 0))
-            .count();
-        let c0 = n_exact as f64 / db_entry.tags.len() as f64;
-        if c0 > 0.0 {
-            scored.push((c0, db_entry));
-        }
-    }
+    // par_iter 对切片是 indexed iterator，collect 保持与串行一致的顺序。
+    let mut scored: Vec<(f64, usize)> = db_entries // (exact containment, entry index)
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, db_entry)| {
+            if db_entry.tags.is_empty() || db_entry.tag_seqs.is_none() {
+                return None;
+            }
+            let n_exact = db_entry.tags.iter()
+                .filter(|t| sample_counts.get(*t).map_or(false, |&c| c > 0))
+                .count();
+            let c0 = n_exact as f64 / db_entry.tags.len() as f64;
+            if c0 > 0.0 {
+                Some((c0, idx))
+            } else {
+                None
+            }
+        })
+        .collect();
     if scored.is_empty() {
         eprintln!("Read error rate: no genomes with exact matches; falling back to e=0 (uncorrected mm1 ANI)");
         return 0.0;
@@ -1477,15 +1582,15 @@ fn estimate_read_error_rate(db_entries: &[SyldbEntry], sample_counts: &FxHashMap
         by_len.into_iter().max_by_key(|(_, n)| *n).map(|(l, _)| l as usize).unwrap_or(K as usize)
     };
 
-    let mut selected: Vec<&SyldbEntry> = scored.iter()
-        .filter(|(c0, entry)| c0.powf(1.0 / dominant_len(entry) as f64) >= ERROR_EST_MIN_ANI)
-        .map(|(_, entry)| *entry)
+    let mut selected: Vec<usize> = scored.iter()
+        .filter(|(c0, idx)| c0.powf(1.0 / dominant_len(&db_entries[*idx]) as f64) >= ERROR_EST_MIN_ANI)
+        .map(|(_, idx)| *idx)
         .collect();
     if selected.is_empty() {
         // 没有近同一基因组：退到 exact containment 最高的 top-N，并在日志中提示
         // 此时 e 可能与真实分歧 a 混淆（趋异群落中应谨慎解释）。
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        selected = scored.iter().take(ERROR_EST_TOP_N).map(|(_, entry)| *entry).collect();
+        selected = scored.iter().take(ERROR_EST_TOP_N).map(|(_, idx)| *idx).collect();
         eprintln!("Read error rate: no genome with mm0-ANI >= {:.0}%; using top {} genomes by exact containment (e may be confounded with true divergence)",
                   ERROR_EST_MIN_ANI * 100.0, selected.len());
     }
@@ -1493,16 +1598,29 @@ fn estimate_read_error_rate(db_entries: &[SyldbEntry], sample_counts: &FxHashMap
     // 第二遍：对候选基因组逐 tag 统计 exact / mm1 命中的 read 数（按长度类）。
     // 一个样本 tag 若是多个候选 ref tag 的邻居会被重复计入 M，这种情况罕见，对比例影响可忽略。
     let mut classes: FxHashMap<u8, (u64, u64)> = FxHashMap::default();
-    for entry in &selected {
+    for &idx in &selected {
+        let entry = &db_entries[idx];
         let tag_seqs = entry.tag_seqs.as_ref().unwrap();
         for (i, tag) in entry.tags.iter().enumerate() {
             let len = entry.tag_lengths.get(i).copied().unwrap_or(K as u8);
             let c_exact = sample_counts.get(tag).copied().unwrap_or(0) as u64;
             let mut c_mm1 = 0u64;
-            if let Some(seq) = tag_seqs.get(i) {
-                for h in one_mismatch_canonical_hashes(seq) {
-                    if let Some(&c) = sample_counts.get(&h) {
-                        c_mm1 += c as u64;
+            // 优先用预计算缓存；无缓存（query 等路径）时保持原来的现算行为。
+            match neighbor_cache.and_then(|cache| cache.get(idx, i)) {
+                Some(neighbors) => {
+                    for &h in neighbors {
+                        if let Some(&c) = sample_counts.get(&h) {
+                            c_mm1 += c as u64;
+                        }
+                    }
+                }
+                None => {
+                    if let Some(seq) = tag_seqs.get(i) {
+                        for h in one_mismatch_canonical_hashes(seq) {
+                            if let Some(&c) = sample_counts.get(&h) {
+                                c_mm1 += c as u64;
+                            }
+                        }
                     }
                 }
             }
@@ -1538,6 +1656,7 @@ fn sample_error_rate(
     mismatch: usize,
     override_e: Option<f64>,
     no_error_correction: bool,
+    neighbor_cache: Option<&MismatchNeighborCache>,
 ) -> f64 {
     if mismatch == 0 || no_error_correction {
         return 0.0;
@@ -1546,7 +1665,41 @@ fn sample_error_rate(
         eprintln!("Read error rate: using fixed e={:.4} from --read-error-rate", e);
         return e.clamp(0.0, MAX_READ_ERROR_RATE);
     }
-    estimate_read_error_rate(db_entries, sample_counts)
+    estimate_read_error_rate(db_entries, sample_counts, neighbor_cache)
+}
+
+/// 每个样本源计算一次 read error rate（初始 pass 与重分配 pass 的输入相同，
+/// 原来两边各估一次；现在由 profile 编排层算好并下传，估计日志也只打一次）。
+fn per_source_error_rates(
+    db_entries: &[SyldbEntry],
+    sample_entries: &[SylspEntry],
+    mismatch: usize,
+    read_error_rate: Option<f64>,
+    no_error_correction: bool,
+    neighbor_cache: Option<&MismatchNeighborCache>,
+) -> FxHashMap<String, f64> {
+    let mut groups: FxHashMap<&str, Vec<&SylspEntry>> = FxHashMap::default();
+    for entry in sample_entries {
+        groups
+            .entry(entry.sample_source.as_str())
+            .or_default()
+            .push(entry);
+    }
+    groups
+        .into_iter()
+        .map(|(source, entries)| {
+            let counts = sample_tag_counts_ref(&entries);
+            let e = sample_error_rate(
+                db_entries,
+                &counts,
+                mismatch,
+                read_error_rate,
+                no_error_correction,
+                neighbor_cache,
+            );
+            (source.to_string(), e)
+        })
+        .collect()
 }
 
 fn filter_results(result: &QueryResult, min_ani: Option<f64>, min_tags_genome: usize) -> bool {
@@ -1591,21 +1744,14 @@ fn query_one_sample_with_cached_db(
     mismatch: usize,
     min_shared_tags: usize,
     min_tags_genome: usize,
-    read_error_rate: Option<f64>,
-    no_error_correction: bool,
+    error_rate: f64, // 由编排层按样本源算好一次，下传复用
+    neighbor_cache: Option<&MismatchNeighborCache>,
 ) -> Vec<QueryResult> {
-    let error_rate = sample_error_rate(
-        cached_db_entries,
-        sample_counts,
-        mismatch,
-        read_error_rate,
-        no_error_correction,
-    );
-
     // 并行处理每个基因组（已按基因组聚合）进行比对
     cached_db_entries
         .par_iter()
-        .filter_map(|db_entry| {
+        .enumerate()
+        .filter_map(|(entry_idx, db_entry)| {
             // 基因组太小/太碎则跳过（sylph min_number_kmers）
             if db_entry.tags.len() < min_tags_genome {
                 return None;
@@ -1616,8 +1762,13 @@ fn query_one_sample_with_cached_db(
                 .iter()
                 .enumerate()
                 .filter_map(|(i, t)| {
-                    let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                    lookup_tag_coverage(*t, seq, sample_counts, mismatch)
+                    if let Some(cache) = neighbor_cache {
+                        lookup_tag_coverage(*t, cache.get(entry_idx, i), sample_counts, mismatch)
+                    } else {
+                        // 无缓存路径（query / sketch 模式）：保持原来的现算行为
+                        let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                        lookup_tag_coverage_regen(*t, seq, sample_counts, mismatch)
+                    }
                 })
                 .collect();
 
@@ -1645,6 +1796,7 @@ fn query_one_sample_with_cached_db(
 }
 
 // 内部函数：使用缓存的数据库数据进行查询 - 优化大文件读取
+#[allow(clippy::too_many_arguments)]
 fn query_single_file_with_cached_db(
     sample_path: &str,
     db_path: &str,
@@ -1654,8 +1806,8 @@ fn query_single_file_with_cached_db(
     mismatch: usize,
     min_shared_tags: usize,
     min_tags_genome: usize,
-    read_error_rate: Option<f64>,
-    no_error_correction: bool,
+    error_rates: &FxHashMap<String, f64>, // 每个样本源一次，由编排层算好下传
+    neighbor_cache: Option<&MismatchNeighborCache>,
 ) -> Result<Vec<QueryResult>> {
     eprintln!("Processing sample file with cached database: {}", sample_path);
     
@@ -1698,6 +1850,7 @@ fn query_single_file_with_cached_db(
 
             // 统计样本中每个 tag 的覆盖度（重数）
             let sample_counts = sample_tag_counts_ref(entries);
+            let error_rate = error_rates.get(sample_source.as_str()).copied().unwrap_or(0.0);
             query_one_sample_with_cached_db(
                 sample_source,
                 &sample_counts,
@@ -1708,8 +1861,8 @@ fn query_single_file_with_cached_db(
                 mismatch,
                 min_shared_tags,
                 min_tags_genome,
-                read_error_rate,
-                no_error_correction,
+                error_rate,
+                neighbor_cache,
             )
         })
         .collect();
@@ -1770,14 +1923,14 @@ pub fn query_single_file(sample_path: &str, db_path: &str, min_ani: f64, mismatc
             let sample_counts = sample_tag_counts_ref(entries);
             let total_sample_tags = entries.len();
             // 无 CLI 上下文：mm1 默认使用数据驱动的 e 估计
-            let error_rate = sample_error_rate(&db_entries, &sample_counts, mismatch, None, false);
+            let error_rate = sample_error_rate(&db_entries, &sample_counts, mismatch, None, false, None);
 
             // 并行处理每个基因组进行比对
             db_entries.par_iter().filter_map(|db_entry| {
                 let covs: Vec<u32> = db_entry.tags.iter().enumerate()
                     .filter_map(|(i, t)| {
                         let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                        lookup_tag_coverage(*t, seq, &sample_counts, mismatch)
+                        lookup_tag_coverage_regen(*t, seq, &sample_counts, mismatch)
                     })
                     .collect();
 
@@ -2272,6 +2425,16 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
     }
     ensure_tag_seqs_for_mismatch(&cached_db_entries, args.mismatch)?;
 
+    // mm1 热路径优化：在处理任何样本之前，一次性并行预计算所有 DB tag 的
+    // 1-mismatch 邻居哈希（纯内存侧结构，与聚合后的 cached_db_entries 对齐）。
+    // sketch 模式不存 tag 序列且强制 mm0，无需缓存。
+    let neighbor_cache: Option<MismatchNeighborCache> =
+        if args.mismatch > 0 && !args.sketch_mode {
+            Some(MismatchNeighborCache::build(&cached_db_entries))
+        } else {
+            None
+        };
+
     // 一次性读取并缓存所有样本文件 - 优化大文件读取
     eprintln!("Loading sample files: {}", args.sample_file);
     let sample_files: Vec<String> = if args.sample_file.ends_with(".txt") {
@@ -2356,6 +2519,24 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
     // 使用 sylph 风格的分块处理，集成k-mer重新分配机制
     chunks.into_iter().for_each(|chunk| {
         chunk.into_par_iter().for_each(|sample_file| {
+            // 每个样本源只估计一次 read error rate：初始 pass 与重分配 pass 的
+            // 输入（db_entries、sample_counts、mismatch）完全相同，原来两边各估一次。
+            // sketch 模式强制 mm0（error rate 恒为 0），无需此表。
+            let error_rates: FxHashMap<String, f64> = if args.sketch_mode {
+                FxHashMap::default()
+            } else {
+                match cached_sample_entries.get(&sample_file) {
+                    Some(entries) if !entries.is_empty() => per_source_error_rates(
+                        &cached_db_entries,
+                        entries,
+                        args.mismatch,
+                        args.read_error_rate,
+                        args.no_error_correction,
+                        neighbor_cache.as_ref(),
+                    ),
+                    _ => FxHashMap::default(),
+                }
+            };
             // 第一阶段：计算初步结果（不使用重新分配）
             let initial_results_opt: Option<Vec<QueryResult>> = if args.sketch_mode {
                 // sketch 模式：每个 SequencesSketch 是一个样本，直接借用 kmer_counts，
@@ -2372,6 +2553,15 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                                 sample_source,
                                 sample_counts.len()
                             );
+                            // sketch 模式强制 mm0，error rate 恒为 0
+                            let error_rate = sample_error_rate(
+                                &cached_db_entries,
+                                sample_counts,
+                                args.mismatch,
+                                args.read_error_rate,
+                                args.no_error_correction,
+                                None,
+                            );
                             query_one_sample_with_cached_db(
                                 &sample_source,
                                 sample_counts,
@@ -2382,8 +2572,8 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                                 args.mismatch,
                                 min_shared_tags,
                                 min_tags_genome,
-                                args.read_error_rate,
-                                args.no_error_correction,
+                                error_rate,
+                                None,
                             )
                         })
                         .collect();
@@ -2399,8 +2589,8 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                     args.mismatch,
                     min_shared_tags,
                     min_tags_genome,
-                    args.read_error_rate,
-                    args.no_error_correction,
+                    &error_rates,
+                    neighbor_cache.as_ref(),
                 )
                 .ok()
             };
@@ -2450,6 +2640,15 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                             }
                             let (sample_source, sample_counts, total_sample_tags) =
                                 sketch_sample_view(sketch);
+                            // sketch 模式强制 mm0，error rate 恒为 0
+                            let error_rate = sample_error_rate(
+                                &cached_db_entries,
+                                sample_counts,
+                                args.mismatch,
+                                args.read_error_rate,
+                                args.no_error_correction,
+                                None,
+                            );
                             let mut res = recalculate_one_sample_with_winner_table(
                                 &sample_source,
                                 sample_counts,
@@ -2462,8 +2661,8 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                                 args.mismatch,
                                 min_shared_tags,
                                 min_tags_genome,
-                                args.read_error_rate,
-                                args.no_error_correction,
+                                error_rate,
+                                None,
                                 &initial_by_contig,
                                 args.reassign_protection,
                             );
@@ -2481,8 +2680,8 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                             args.mismatch,
                             min_shared_tags,
                             min_tags_genome,
-                            args.read_error_rate,
-                            args.no_error_correction,
+                            &error_rates,
+                            neighbor_cache.as_ref(),
                             &initial_results,
                             args.reassign_protection,
                         )
@@ -2931,21 +3130,27 @@ mod tests {
         let exact_hash = hash_bytes(ref_seq);
         let neighbor_seq = b"AAACCG"; // 1 mismatch
         let neighbor_hash = hash_bytes(neighbor_seq);
+        let neighbors = one_mismatch_canonical_hashes(ref_seq);
 
         sample_counts.insert(exact_hash, 5);
         sample_counts.insert(neighbor_hash, 3);
 
         // exact mode：只命中 exact
-        assert_eq!(lookup_tag_coverage(exact_hash, Some(&ref_seq.to_vec()), &sample_counts, 0), Some(5));
+        assert_eq!(lookup_tag_coverage(exact_hash, None, &sample_counts, 0), Some(5));
         // mismatch mode：优先 exact（5 > 3）
-        assert_eq!(lookup_tag_coverage(exact_hash, Some(&ref_seq.to_vec()), &sample_counts, 1), Some(5));
+        assert_eq!(lookup_tag_coverage(exact_hash, Some(&neighbors), &sample_counts, 1), Some(5));
 
         // 把 exact 计数设为 0，mismatch mode 应命中 neighbor
         sample_counts.insert(exact_hash, 0);
-        assert_eq!(lookup_tag_coverage(exact_hash, Some(&ref_seq.to_vec()), &sample_counts, 1), Some(3));
+        assert_eq!(lookup_tag_coverage(exact_hash, Some(&neighbors), &sample_counts, 1), Some(3));
 
-        // 无 tag_seqs 时 mismatch mode 无法生成邻居，只能 exact match
+        // 无预计算邻居时 mismatch mode 只能 exact match
         assert_eq!(lookup_tag_coverage(exact_hash, None, &sample_counts, 1), None);
+
+        // 现算封装（无缓存路径）应与预生成邻居的查表结果一致
+        assert_eq!(lookup_tag_coverage_regen(exact_hash, Some(&ref_seq.to_vec()), &sample_counts, 1), Some(3));
+        assert_eq!(lookup_tag_coverage_regen(exact_hash, None, &sample_counts, 1), None);
+        assert_eq!(lookup_tag_coverage_regen(exact_hash, Some(&ref_seq.to_vec()), &sample_counts, 0), None);
     }
 
     #[test]
@@ -3021,12 +3226,12 @@ mod tests {
         let empty_db: Vec<SyldbEntry> = Vec::new();
         let empty_counts: FxHashMap<Hash, u32> = FxHashMap::default();
 
-        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 1, Some(0.01), true), 0.0);
-        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 1, Some(0.01), false), 0.01);
+        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 1, Some(0.01), true, None), 0.0);
+        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 1, Some(0.01), false, None), 0.01);
         // mismatch=0 时完全忽略 error correction 设置。
-        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 0, Some(0.01), false), 0.0);
+        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 0, Some(0.01), false, None), 0.0);
         // 无 override + 无数据 → 估计回退到 0（旧行为）。
-        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 1, None, false), 0.0);
+        assert_eq!(sample_error_rate(&empty_db, &empty_counts, 1, None, false, None), 0.0);
     }
 
     #[test]
@@ -3095,8 +3300,13 @@ mod tests {
             enzyme: "BcgI".to_string(),
         };
         let db = vec![entry];
-        let e = estimate_read_error_rate(&db, &sample_counts);
+        let e = estimate_read_error_rate(&db, &sample_counts, None);
         assert!((e - 0.005).abs() < 0.002, "estimated e={}", e);
+
+        // 预计算邻居缓存路径应与现算路径给出完全相同的估计
+        let cache = MismatchNeighborCache::build(&db);
+        let e_cached = estimate_read_error_rate(&db, &sample_counts, Some(&cache));
+        assert_eq!(e, e_cached, "cached vs regen neighbor path must agree");
     }
 
     #[test]
@@ -3195,6 +3405,9 @@ mod tests {
         let min_ani = 95.0;
         let min_shared = 50;
         let min_tags_genome = 1;
+        // mm0 → error rate 恒为 0；与 profile 编排层下传的 per-source 表结构一致
+        let error_rates: FxHashMap<String, f64> =
+            [("s1".to_string(), 0.0)].into_iter().collect();
 
         // 保护开启：B（存活 4%）被保留 —— 初始 ANI/shared_tags，重分配后的 eff_cov。
         let protected = recalculate_with_winner_table(
@@ -3207,8 +3420,8 @@ mod tests {
             0,
             min_shared,
             min_tags_genome,
+            &error_rates,
             None,
-            false,
             &initial,
             true,
         );
@@ -3252,8 +3465,8 @@ mod tests {
             0,
             min_shared,
             min_tags_genome,
+            &error_rates,
             None,
-            false,
             &initial,
             false,
         );
@@ -3280,8 +3493,8 @@ mod tests {
             0,
             min_shared,
             min_tags_genome,
+            &error_rates,
             None,
-            false,
             &low_ani_initial,
             true,
         );
