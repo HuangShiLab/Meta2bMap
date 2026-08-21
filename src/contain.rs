@@ -817,35 +817,50 @@ pub fn query(args: ContainArgs) -> Result<()> {
                             None,
                         );
 
-                        // 对每个基因组进行比对
-                        for db_entry in &db_entries {
-                            let covs: Vec<u32> = db_entry
-                                .tags
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(i, t)| {
-                                    let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                                    lookup_tag_coverage_regen(*t, seq, sample_counts, args.mismatch)
-                                })
-                                .collect();
+                        // 对每个基因组进行比对（par_iter 保序 collect，输出行序不变）
+                        let results: Vec<QueryResult> = db_entries
+                            .par_iter()
+                            .filter_map(|db_entry| {
+                                let covs: Vec<u32> = db_entry
+                                    .tags
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, t)| {
+                                        let seq =
+                                            db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                                        lookup_tag_coverage_regen(
+                                            *t,
+                                            seq,
+                                            sample_counts,
+                                            args.mismatch,
+                                        )
+                                    })
+                                    .collect();
 
-                            // 覆盖度校正后的 ANI 统计
-                            let mut result = calculate_statistics(
-                                covs,
-                                &db_entry.tag_lengths,
-                                total_sample_tags,
-                                db_entry.tags.len(),
-                                args.mismatch,
-                                error_rate,
-                            );
-                            result.sample_file = sample_source.clone();
-                            result.genome_file = db_path.to_string();
-                            result.contig_name = db_entry.sequence_id.clone();
+                                // 覆盖度校正后的 ANI 统计
+                                let mut result = calculate_statistics(
+                                    covs,
+                                    &db_entry.tag_lengths,
+                                    total_sample_tags,
+                                    db_entry.tags.len(),
+                                    args.mismatch,
+                                    error_rate,
+                                );
+                                result.sample_file = sample_source.clone();
+                                result.genome_file = db_path.to_string();
+                                result.contig_name = db_entry.sequence_id.clone();
 
-                            // 应用过滤条件
-                            if filter_results(&result, args.minimum_ani, args.min_tags_genome) {
-                                print_result(&result, &writer)?;
-                            }
+                                // 应用过滤条件
+                                if filter_results(&result, args.minimum_ani, args.min_tags_genome)
+                                {
+                                    Some(result)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        for result in &results {
+                            print_result(result, &writer)?;
                         }
                     }
                     return Ok(());
@@ -888,36 +903,44 @@ pub fn query(args: ContainArgs) -> Result<()> {
                     None,
                 );
 
-                // 对每个基因组进行比对
-                for db_entry in &db_entries {
-                    // 命中 tag 的覆盖度向量（支持 ≤1 mismatch）
-                    let covs: Vec<u32> = db_entry
-                        .tags
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, t)| {
-                            let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
-                            lookup_tag_coverage_regen(*t, seq, &sample_counts, args.mismatch)
-                        })
-                        .collect();
+                // 对每个基因组进行比对（par_iter 保序 collect，输出行序不变）
+                let results: Vec<QueryResult> = db_entries
+                    .par_iter()
+                    .filter_map(|db_entry| {
+                        // 命中 tag 的覆盖度向量（支持 ≤1 mismatch）
+                        let covs: Vec<u32> = db_entry
+                            .tags
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, t)| {
+                                let seq = db_entry.tag_seqs.as_ref().and_then(|v| v.get(i));
+                                lookup_tag_coverage_regen(*t, seq, &sample_counts, args.mismatch)
+                            })
+                            .collect();
 
-                    // 覆盖度校正后的 ANI 统计
-                    let mut result = calculate_statistics(
-                        covs,
-                        &db_entry.tag_lengths,
-                        total_sample_tags,
-                        db_entry.tags.len(),
-                        args.mismatch,
-                        error_rate,
-                    );
-                    result.sample_file = sample_path.to_string();
-                    result.genome_file = db_path.to_string();
-                    result.contig_name = db_entry.sequence_id.clone();
+                        // 覆盖度校正后的 ANI 统计
+                        let mut result = calculate_statistics(
+                            covs,
+                            &db_entry.tag_lengths,
+                            total_sample_tags,
+                            db_entry.tags.len(),
+                            args.mismatch,
+                            error_rate,
+                        );
+                        result.sample_file = sample_path.to_string();
+                        result.genome_file = db_path.to_string();
+                        result.contig_name = db_entry.sequence_id.clone();
 
-                    // 应用过滤条件
-                    if filter_results(&result, args.minimum_ani, args.min_tags_genome) {
-                        print_result(&result, &writer)?;
-                    }
+                        // 应用过滤条件
+                        if filter_results(&result, args.minimum_ani, args.min_tags_genome) {
+                            Some(result)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for result in &results {
+                    print_result(result, &writer)?;
                 }
                 Ok(())
             })?;
@@ -2235,15 +2258,31 @@ fn write_abundance_matrix(
     writeln!(tsv_writer)?;
     writeln!(writer)?;
 
+    // 预建每个样本的 genome_id -> abundance 索引，将 O(G*S*R) 线性查找降为 O(G*S)。
+    // 同一基因组在同一样本中出现多次时与原 `iter().find()` 语义一致：取第一条。
+    let sample_index: FxHashMap<&str, FxHashMap<&str, f64>> = sample_ids
+        .iter()
+        .map(|sample_id| {
+            let mut idx: FxHashMap<&str, f64> = FxHashMap::default();
+            if let Some(results) = sample_groups.get(sample_id.as_str()) {
+                for r in results {
+                    idx.entry(r.genome_id.as_str())
+                        .or_insert(r.taxonomic_abundance);
+                }
+            }
+            (sample_id.as_str(), idx)
+        })
+        .collect();
+
     // 采用 sylph 的高效并行数据收集策略
     let genome_data: Vec<(String, Vec<f64>)> = all_genomes.par_iter()
         .map(|genome_id| {
             let abundances: Vec<f64> = sample_ids.iter()
                 .map(|sample_id| {
-                    sample_groups.get(sample_id.as_str())
-                        .and_then(|results| results.iter()
-                            .find(|r| r.genome_id == *genome_id))
-                        .map(|r| r.taxonomic_abundance)
+                    sample_index
+                        .get(sample_id.as_str())
+                        .and_then(|idx| idx.get(genome_id.as_str()))
+                        .copied()
                         .unwrap_or(0.0)
                 })
                 .collect();

@@ -22,7 +22,7 @@ pub type Kmer = u64;
 type Marker = u32;
 
 // 从sylph复制的常量和函数
-const BYTE_TO_SEQ: [u8; 256] = [
+pub(crate) const BYTE_TO_SEQ: [u8; 256] = [
     0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
@@ -103,8 +103,22 @@ pub fn mm_hash64(kmer: u64) -> u64 {
     key
 }
 
-// K-mer提取函数
+// K-mer提取函数（x86_64 上运行时检测 AVX2 走 SIMD 路径；输出与标量版本逐位一致。
+// 注：曾实现过 NEON 版本，但实测在 Apple silicon 上比标量慢 ~15%（标量 mm_hash64
+// 本身可被乱序执行充分流水化，NEON lane 插入/提取开销超过收益），故 aarch64 走标量）
+#[allow(unreachable_code)]
 pub fn extract_kmers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: 已检测到 AVX2 支持
+        unsafe { crate::avx2_seeding::extract_kmers_avx2(string, kmer_vec, c, k) };
+        return;
+    }
+    extract_kmers_scalar(string, kmer_vec, c, k);
+}
+
+// K-mer提取函数（标量参考实现，同时作为无 SIMD 平台的回退路径）
+pub fn extract_kmers_scalar(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
     if string.len() < k {
         return;
     }
@@ -164,8 +178,34 @@ pub fn extract_kmers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize)
     }
 }
 
-// 提取k-mers及其位置信息
+// 提取k-mers及其位置信息（运行时 SIMD 调度入口；输出与标量版本逐位一致）
+#[allow(unreachable_code)]
 pub fn extract_kmers_positions(
+    string: &[u8],
+    kmer_vec: &mut Vec<(usize, usize, u64)>,
+    c: usize,
+    k: usize,
+    contig_number: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: 已检测到 AVX2 支持
+        unsafe {
+            crate::avx2_seeding::extract_kmers_positions_avx2(
+                string,
+                kmer_vec,
+                c,
+                k,
+                contig_number,
+            )
+        };
+        return;
+    }
+    extract_kmers_positions_scalar(string, kmer_vec, c, k, contig_number);
+}
+
+// 提取k-mers及其位置信息（标量参考实现，同时作为无 SIMD 平台的回退路径）
+pub fn extract_kmers_positions_scalar(
     string: &[u8],
     kmer_vec: &mut Vec<(usize, usize, u64)>,
     c: usize,
@@ -1414,5 +1454,125 @@ mod tests {
         assert!(!a.is_empty());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- SIMD 路径与标量路径等价性测试 ----
+
+    // 在 x86_64 + AVX2 上调用 SIMD 实现；其他平台退化为标量（此时测试验证调度恒等性）
+    fn simd_extract_kmers(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                unsafe { crate::avx2_seeding::extract_kmers_avx2(string, kmer_vec, c, k) };
+                return;
+            }
+        }
+        extract_kmers_scalar(string, kmer_vec, c, k);
+    }
+
+    fn simd_extract_kmers_positions(
+        string: &[u8],
+        kmer_vec: &mut Vec<(usize, usize, u64)>,
+        c: usize,
+        k: usize,
+        contig_number: usize,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    crate::avx2_seeding::extract_kmers_positions_avx2(
+                        string,
+                        kmer_vec,
+                        c,
+                        k,
+                        contig_number,
+                    )
+                };
+                return;
+            }
+        }
+        extract_kmers_positions_scalar(string, kmer_vec, c, k, contig_number);
+    }
+
+    #[test]
+    fn test_extract_kmers_simd_matches_scalar() {
+        // 边界用例：短于 k、恰好 k、奇数长度、前 k-1 含 N（整段跳过）、
+        // 中间/末尾含 N、混合大小写、含其他无效字符
+        let rand = |len: usize, seed: u64| random_seq(len, seed);
+        let cases: Vec<(usize, usize, String)> = vec![
+            (200, 31, "ACGT".to_string()),              // 短于 k
+            (200, 31, rand(31, 1)),                     // 恰好等于 k
+            (200, 31, rand(32, 2)),                     // k+1
+            (200, 21, rand(20, 3)),                     // 短于 k=21
+            (200, 21, rand(10_001, 4)),                 // k=21 奇数长度
+            (200, 31, rand(10_003, 5)),                 // k=31 奇数长度
+            (7, 31, rand(999, 6)),                      // 非整除的 c
+            (1, 31, rand(5_000, 7)),                    // c=1 全部通过阈值
+            (200, 17, rand(777, 8)),                    // 非常规 k
+            (200, 31, format!("NNNN{}", rand(500, 9))), // 前 k-1 含 N -> 空
+            (200, 31, {
+                // 中间含 N（N 被跳过，滚动窗口跨 N 延续——复现标量语义）
+                let mut s = rand(400, 10);
+                s.insert_str(100, "NNN");
+                s.insert_str(250, "n");
+                s
+            }),
+            (200, 31, {
+                // 末尾 N + 无效字符 X
+                let mut s = rand(300, 11);
+                s.push('X');
+                s.push('N');
+                s
+            }),
+            (200, 21, rand(3, 12)), // 远短于 k
+        ];
+
+        for (c, k, seq) in &cases {
+            let mut scalar_vec = Vec::new();
+            let mut simd_vec = Vec::new();
+            extract_kmers_scalar(seq.as_bytes(), &mut scalar_vec, *c, *k);
+            simd_extract_kmers(seq.as_bytes(), &mut simd_vec, *c, *k);
+            assert_eq!(
+                scalar_vec, simd_vec,
+                "extract_kmers mismatch: c={}, k={}, seq_len={}",
+                c,
+                k,
+                seq.len()
+            );
+
+            let mut scalar_pos = Vec::new();
+            let mut simd_pos = Vec::new();
+            extract_kmers_positions_scalar(seq.as_bytes(), &mut scalar_pos, *c, *k, 3);
+            simd_extract_kmers_positions(seq.as_bytes(), &mut simd_pos, *c, *k, 3);
+            assert_eq!(
+                scalar_pos, simd_pos,
+                "extract_kmers_positions mismatch: c={}, k={}, seq_len={}",
+                c,
+                k,
+                seq.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_kmers_dispatch_matches_scalar() {
+        // 调度入口 extract_kmers / extract_kmers_positions 必须与标量结果一致
+        for seed in 0..5u64 {
+            let seq = random_seq(20_000 + seed as usize, 0xdeadbeef + seed);
+            for &(c, k) in &[(200usize, 31usize), (100, 21)] {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                extract_kmers_scalar(seq.as_bytes(), &mut a, c, k);
+                extract_kmers(seq.as_bytes(), &mut b, c, k);
+                assert_eq!(a, b, "dispatch mismatch: c={}, k={}, seed={}", c, k, seed);
+
+                let mut ap = Vec::new();
+                let mut bp = Vec::new();
+                extract_kmers_positions_scalar(seq.as_bytes(), &mut ap, c, k, 0);
+                extract_kmers_positions(seq.as_bytes(), &mut bp, c, k, 0);
+                assert_eq!(ap, bp, "positions dispatch mismatch: c={}, k={}", c, k);
+            }
+        }
     }
 }

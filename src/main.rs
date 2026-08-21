@@ -21,6 +21,9 @@ mod view;
 mod mark;
 mod merge;
 
+#[cfg(target_arch = "x86_64")]
+mod avx2_seeding;
+
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc; //use std::panic::set_hook;
 
