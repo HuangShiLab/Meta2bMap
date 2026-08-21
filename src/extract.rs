@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use bio::io::{fasta, fastq};
 use needletail::parse_fastx_file;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 // bytes::Regex 直接在 &[u8] 上匹配，避免每条序列的 from_utf8_lossy 全量拷贝。
@@ -255,10 +254,122 @@ pub const ENZYME_TAG_LENGTHS: &[(&str, usize)] = &[
 pub struct EnzymeSpec {
     pub name: String,
     pub patterns: Vec<Regex>,
+    /// 单趟扫描引擎（按 pattern 数量分派，见 EnzymeSpec::new 的注释）。
+    pub scanner: ScanMode,
     /// 每个 pattern 对应的 tag 长度。多酶模式下 pattern 来自不同酶，长度可能不同。
     pub pattern_tag_lengths: Vec<usize>,
     /// 主 tag 长度（日志/统计使用，取第一个酶的 tag 长度）。
     pub tag_length: usize,
+}
+
+/// 单趟扫描引擎。两种实现产出的命中集合与顺序完全一致（均由单元测试对照
+/// 旧版逐 pattern 扫描验证），仅性能特征不同：
+/// - Regex：组合 alternation 共享各分支的字面量 prefilter，pattern 少时 lazy DFA
+///   装得下，单趟最快；pattern 多时 DFA 状态爆炸退化为 PikeVM 逐字节模拟，极慢。
+/// - Ac：Aho-Corasick 对所有 pattern 的最长字面量核心串做 overlapping 扫描得到
+///   候选起点，再做逐位置掩码验证。overlapping 迭代没有 prefilter，pattern 少时
+///   不如 Regex 路径，但随 pattern 数扩展良好（`--enzyme all` 29 个 pattern）。
+#[derive(Debug)]
+pub enum ScanMode {
+    Regex {
+        /// 所有 pattern 的组合 alternation，单趟定位任一 pattern 的下一个命中起点。
+        combined: Regex,
+        /// 每个 pattern 的锚定版本（^(?:pat)），在命中起点确认具体哪些 pattern 匹配。
+        anchored: Vec<Regex>,
+    },
+    Ac {
+        /// 所有核心串组成的 Aho-Corasick 自动机（pattern id 与 `patterns` 索引一一对应，
+        /// 重复核心串各自占位）。
+        ac: aho_corasick::AhoCorasick,
+        /// 每个 pattern 的逐位置碱基掩码（bit: A=1,C=2,G=4,T=8），
+        /// 用于命中窗口的直接验证（等价于原正则的定长匹配）。
+        masks: Vec<Vec<u8>>,
+        /// 每个 pattern 选定的触发核心串（最长字面量段）在 pattern 内的偏移。
+        core_off: Vec<usize>,
+        /// 每个 pattern 的第二长字面量段（偏移, 字节），全掩码验证前的快速过滤。
+        core2: Vec<Option<(usize, Vec<u8>)>>,
+    },
+}
+
+/// 少于等于该数量的 pattern 走 Regex 路径（实测 BcgI 2 个 pattern 时比 AC 快约 2x）；
+/// 超过则走 AC（29 个 pattern 时 Regex 路径比基线慢几十倍）。
+const REGEX_SCAN_MAX_PATTERNS: usize = 8;
+
+/// 碱基到掩码位的查表（A=1,C=2,G=4,T=8，其他为 0）。
+const BASE_BIT: [u8; 256] = {
+    let mut table = [0u8; 256];
+    table[b'A' as usize] = 1;
+    table[b'C' as usize] = 2;
+    table[b'G' as usize] = 4;
+    table[b'T' as usize] = 8;
+    table
+};
+
+/// 把酶切正则（仅由 ACGT 字面量、[...] 字符类和定长 {n} 重复组成）解析为
+/// 逐位置掩码 + 字面量段列表（偏移, 字节）。语法超出的 pattern 直接报错。
+fn parse_pattern_masks(pat: &str) -> Result<(Vec<u8>, Vec<(usize, Vec<u8>)>)> {
+    let b = pat.as_bytes();
+    let mut i = 0usize;
+    let mut masks = Vec::new();
+    let mut runs: Vec<(usize, Vec<u8>)> = Vec::new();
+    while i < b.len() {
+        match b[i] {
+            b'[' => {
+                let j = b[i..]
+                    .iter()
+                    .position(|&c| c == b']')
+                    .map(|p| p + i)
+                    .ok_or_else(|| anyhow::anyhow!("Unclosed class in pattern: {}", pat))?;
+                let mut m = 0u8;
+                for &c in &b[i + 1..j] {
+                    let bit = BASE_BIT[c as usize];
+                    if bit == 0 {
+                        return Err(anyhow::anyhow!("Unsupported char in pattern: {}", pat));
+                    }
+                    m |= bit;
+                }
+                i = j + 1;
+                // 可选的 {n} 定长重复
+                let rep = if i < b.len() && b[i] == b'{' {
+                    let k = b[i..]
+                        .iter()
+                        .position(|&c| c == b'}')
+                        .map(|p| p + i)
+                        .ok_or_else(|| anyhow::anyhow!("Unclosed quantifier in pattern: {}", pat))?;
+                    let n: usize = std::str::from_utf8(&b[i + 1..k])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| anyhow::anyhow!("Bad quantifier in pattern: {}", pat))?;
+                    i = k + 1;
+                    n
+                } else {
+                    1
+                };
+                for _ in 0..rep {
+                    masks.push(m);
+                }
+            }
+            c @ (b'A' | b'C' | b'G' | b'T') => {
+                let _ = c;
+                let start = i;
+                let off = masks.len();
+                while i < b.len() && matches!(b[i], b'A' | b'C' | b'G' | b'T') {
+                    masks.push(BASE_BIT[b[i] as usize]);
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'{' {
+                    // 当前酶表不存在「字面量段后接 {n}」的情况，拒绝以避免静默错解
+                    return Err(anyhow::anyhow!(
+                        "Quantifier on literal run unsupported: {}",
+                        pat
+                    ));
+                }
+                runs.push((off, b[start..i].to_vec()));
+            }
+            _ => return Err(anyhow::anyhow!("Unsupported syntax in pattern: {}", pat)),
+        }
+    }
+    Ok((masks, runs))
 }
 
 impl EnzymeSpec {
@@ -274,6 +385,7 @@ impl EnzymeSpec {
         }
 
         let mut all_patterns = Vec::new();
+        let mut all_pattern_strs = Vec::new();
         let mut all_lengths = Vec::new();
         let mut seen = FxHashSet::default();
 
@@ -294,9 +406,69 @@ impl EnzymeSpec {
 
             for pat in def.1 {
                 all_patterns.push(Regex::new(pat).context(format!("Invalid regex pattern: {}", pat))?);
+                all_pattern_strs.push(*pat);
                 all_lengths.push(tag_length);
             }
         }
+
+        // 单趟扫描引擎按 pattern 数量分派（见 ScanMode 注释）：
+        // 少量 pattern 用组合 alternation（共享 prefilter，实测最快）；
+        // 大量 pattern 用 AC 核心串触发 + 掩码验证（随 pattern 数扩展良好）。
+        // 曾尝试对 29 个 pattern 也用 alternation + 放大 DFA 缓存，仍会退化，比
+        // 逐 pattern 基线慢几十倍。
+        let scanner = if all_pattern_strs.len() <= REGEX_SCAN_MAX_PATTERNS {
+            let combined = regex::bytes::RegexBuilder::new(&format!(
+                "(?:{})",
+                all_pattern_strs.join("|")
+            ))
+            .dfa_size_limit(64 * (1 << 20))
+            .build()
+            .context("Invalid combined enzyme pattern")?;
+            let mut anchored = Vec::with_capacity(all_pattern_strs.len());
+            for pat in &all_pattern_strs {
+                anchored.push(
+                    Regex::new(&format!("^(?:{})", pat))
+                        .context(format!("Invalid anchored regex pattern: {}", pat))?,
+                );
+            }
+            ScanMode::Regex { combined, anchored }
+        } else {
+            let mut all_masks = Vec::with_capacity(all_pattern_strs.len());
+            let mut core_off = Vec::with_capacity(all_pattern_strs.len());
+            let mut core2: Vec<Option<(usize, Vec<u8>)>> =
+                Vec::with_capacity(all_pattern_strs.len());
+            let mut run_store: Vec<Vec<(usize, Vec<u8>)>> =
+                Vec::with_capacity(all_pattern_strs.len());
+            for pat in &all_pattern_strs {
+                let (masks, mut runs) = parse_pattern_masks(pat)?;
+                if runs.is_empty() {
+                    return Err(anyhow::anyhow!("Pattern has no literal core: {}", pat));
+                }
+                // 按长度降序：最长段为触发核心，次长段（>=2bp）为快速过滤器
+                runs.sort_by_key(|(_, s)| std::cmp::Reverse(s.len()));
+                let c2 = if runs.len() > 1 && runs[1].1.len() >= 2 {
+                    Some(runs[1].clone())
+                } else {
+                    None
+                };
+                core_off.push(runs[0].0);
+                core2.push(c2);
+                all_masks.push(masks);
+                run_store.push(runs);
+            }
+            let core_strs: Vec<&[u8]> = run_store.iter().map(|r| r[0].1.as_slice()).collect();
+            let ac = aho_corasick::AhoCorasick::builder()
+                .match_kind(aho_corasick::MatchKind::Standard)
+                .kind(Some(aho_corasick::AhoCorasickKind::DFA))
+                .build(core_strs)
+                .map_err(|e| anyhow::anyhow!("Failed to build AC automaton: {}", e))?;
+            ScanMode::Ac {
+                ac,
+                masks: all_masks,
+                core_off,
+                core2,
+            }
+        };
 
         let primary_length = all_lengths[0];
         let display_name = names.join(",");
@@ -304,6 +476,7 @@ impl EnzymeSpec {
         Ok(Self {
             name: display_name,
             patterns: all_patterns,
+            scanner,
             pattern_tag_lengths: all_lengths,
             tag_length: primary_length,
         })
@@ -342,36 +515,89 @@ fn canonicalize_into(tag: &[u8], buf: &mut [u8; MAX_TAG_LEN]) -> usize {
     n
 }
 
-/// 从序列中提取所有 canonical tag 的哈希及其长度（按 u64 去重），不为每个 tag 分配 Vec。
-/// 下游（syldb/sylsp）只使用 tag 的 u64 哈希，因此这是最热路径的首选。
-fn extract_tag_hashes(seq: &[u8], enzyme: &EnzymeSpec) -> Vec<(Hash, u8)> {
-    let mut hashes = Vec::with_capacity(64);
-    let mut seen = FxHashSet::default();
-    let mut buf = [0u8; MAX_TAG_LEN];
-    for (offset, len) in find_all_tag_positions(seq, enzyme) {
-        let n = canonicalize_into(&seq[offset..offset + len], &mut buf);
-        let h = hash_bytes(&buf[..n]);
-        if seen.insert(h) {
-            hashes.push((h, n as u8));
-        }
-    }
-    hashes
+/// 每条 read/contig 复用的临时缓冲区，在文件的 record 循环外创建一次、
+/// 循环内 clear 复用，避免 per-read 的 Vec/FxHashSet 堆分配。
+struct TagBufs {
+    /// find_all_tag_positions_into 的原始命中 (pattern_idx, start, len)，排序前的暂存。
+    hits: Vec<(usize, usize, usize)>,
+    /// 排序后的 (start, len)，顺序与旧版逐 pattern 扫描完全一致。
+    positions: Vec<(usize, usize)>,
+    /// 按 u64 哈希去重。
+    seen: FxHashSet<Hash>,
+    /// canonical 化的栈上缓冲。
+    cbuf: [u8; MAX_TAG_LEN],
 }
 
-/// 与 `extract_tag_hashes` 相同的扫描，但返回 canonical tag 的字节序列及其长度（按哈希去重）。
-/// 仅用于需要输出实际 tag 序列（如 reads→FASTA）的少数路径。
-fn extract_canonical_tags(seq: &[u8], enzyme: &EnzymeSpec) -> Vec<(TagHash, u8)> {
-    let mut tags = Vec::with_capacity(64);
-    let mut seen = FxHashSet::default();
-    let mut buf = [0u8; MAX_TAG_LEN];
-    for (offset, len) in find_all_tag_positions(seq, enzyme) {
-        let n = canonicalize_into(&seq[offset..offset + len], &mut buf);
-        let h = hash_bytes(&buf[..n]);
-        if seen.insert(h) {
-            tags.push((buf[..n].to_vec(), n as u8));
+impl Default for TagBufs {
+    fn default() -> Self {
+        Self {
+            hits: Vec::new(),
+            positions: Vec::new(),
+            seen: FxHashSet::default(),
+            cbuf: [0u8; MAX_TAG_LEN],
         }
     }
-    tags
+}
+
+/// `extract_tag_hashes` 的缓冲复用版本：结果写入 `out`（内部先 clear）。
+fn extract_tag_hashes_into(
+    seq: &[u8],
+    enzyme: &EnzymeSpec,
+    bufs: &mut TagBufs,
+    out: &mut Vec<(Hash, u8)>,
+) {
+    out.clear();
+    bufs.seen.clear();
+    find_all_tag_positions_into(seq, enzyme, &mut bufs.hits, &mut bufs.positions);
+    for &(offset, len) in &bufs.positions {
+        let n = canonicalize_into(&seq[offset..offset + len], &mut bufs.cbuf);
+        let h = hash_bytes(&bufs.cbuf[..n]);
+        if bufs.seen.insert(h) {
+            out.push((h, n as u8));
+        }
+    }
+}
+
+/// `extract_canonical_tags` 的缓冲复用版本，同时返回去重用的哈希，
+/// 避免调用方对同一 tag 二次 hash_bytes。结果写入 `out`（内部先 clear）。
+fn extract_canonical_tags_into(
+    seq: &[u8],
+    enzyme: &EnzymeSpec,
+    bufs: &mut TagBufs,
+    out: &mut Vec<(Hash, TagHash, u8)>,
+) {
+    out.clear();
+    bufs.seen.clear();
+    find_all_tag_positions_into(seq, enzyme, &mut bufs.hits, &mut bufs.positions);
+    for &(offset, len) in &bufs.positions {
+        let n = canonicalize_into(&seq[offset..offset + len], &mut bufs.cbuf);
+        let h = hash_bytes(&bufs.cbuf[..n]);
+        if bufs.seen.insert(h) {
+            out.push((h, bufs.cbuf[..n].to_vec(), n as u8));
+        }
+    }
+}
+
+/// rust-bio fastq 的 `id()` 只在第一个空格处截断（tab 不截断，见 bio-1.6 fastq.rs
+/// `splitn(2, ' ')`），而 needletail 的 `id()` 返回完整 header 行。
+/// 统一按首个空格截断，保证切换解析器后 id 逐字节一致。
+#[inline]
+fn fastq_id(id: &[u8]) -> &[u8] {
+    match id.iter().position(|&b| b == b' ') {
+        Some(p) => &id[..p],
+        None => id,
+    }
+}
+
+/// rust-bio fasta 的 `id()` 在第一个任意空白字符处截断
+/// （`splitn(2, char::is_whitespace)`），needletail 返回完整 header 行。
+/// 统一按首个 ASCII 空白截断，与基线一致。
+#[inline]
+fn fasta_id(id: &[u8]) -> &[u8] {
+    match id.iter().position(|b| b.is_ascii_whitespace()) {
+        Some(p) => &id[..p],
+        None => id,
+    }
 }
 
 /// 生成 `tag` 的所有 canonical 1-mismatch 变体的哈希。
@@ -465,33 +691,117 @@ pub fn ani_from_containment_one_mismatch_err(containment: f64, len: usize, e: f6
 /// that overlap by a few bases are *both* reported in Perl, but
 /// `find_iter`-based scanning would silently miss the second one.
 ///
-/// This reproduces that exact rewind technique using `Regex::find_at`,
-/// which — unlike testing an anchored copy of the pattern against every
-/// fixed-length window — lets the regex engine keep using its normal
-/// literal/Aho-Corasick prefiltering to jump straight to the next candidate
-/// position instead of re-verifying the whole pattern at every single
-/// offset. In benchmarks this is ~15-17x faster than a naive per-offset
-/// windowed scan, and within noise of the original (overlap-missing)
-/// `find_iter` loop it replaces. All enzyme patterns use fixed-count `{n}`
-/// repetitions only (no variable-length quantifiers), so every match is
-/// guaranteed to have length `enzyme.tag_length` regardless of where it
-/// starts — no separate anchoring or length check is needed.
+/// This reproduces the same hit set and ordering in a *single* combined
+/// scan (see `find_all_tag_positions_into`, which dispatches between two
+/// equivalent single-pass engines based on pattern count). All enzyme
+/// patterns use fixed-count `{n}` repetitions only (no variable-length
+/// quantifiers), so every match is guaranteed to have length
+/// `enzyme.tag_length` regardless of where it starts — no separate
+/// anchoring or length check is needed for the hit length itself.
+#[cfg(test)]
 fn find_all_tag_positions(seq: &[u8], enzyme: &EnzymeSpec) -> Vec<(usize, usize)> {
+    let mut hits = Vec::new();
     let mut out = Vec::new();
-    for (pattern, &tag_len) in enzyme.patterns.iter().zip(&enzyme.pattern_tag_lengths) {
-        let mut start = 0usize;
-        while start <= seq.len() {
-            match pattern.find_at(seq, start) {
-                Some(m) => {
-                    let mstart = m.start();
-                    out.push((mstart, tag_len));
-                    start = mstart + 1; // rewind: mirrors Perl's `pos($seq) = match_start + 1`
+    find_all_tag_positions_into(seq, enzyme, &mut hits, &mut out);
+    out
+}
+
+/// 单趟扫描版本，按 `enzyme.scanner` 分派两种等价实现：
+///
+/// - Regex：组合 alternation 的 `find_at` 定位「任一 pattern 的下一个命中起点」，
+///   然后在该起点用各 pattern 的锚定正则确认具体哪些 pattern 命中。
+/// - Ac：Aho-Corasick 对所有 pattern 的最长字面量核心串做一遍 overlapping 扫描
+///   得到候选起点，再用逐位置碱基掩码做定长窗口验证。
+///
+/// 与旧版「逐 pattern 全序列扫描 + 命中后 rewind 到 match_start+1」的等价性论证：
+/// - 旧版对 pattern i 报告所有满足「pattern i 在起点 s 处完整匹配」的 s（正则定长，
+///   从 s+1 继续找不会遗漏任何起点），即命中集合为 {(s, i): pattern i 匹配于 s}。
+/// - Regex 路径：游标每次只前进到「上一个命中起点+1」。若某起点 s 处有任一 pattern
+///   命中且尚未被访问，则 `find_at(seq, cursor)`（cursor ≤ s）返回的最左命中起点 s'
+///   满足 cursor ≤ s' ≤ s；归纳可知所有命中起点都会按升序被访问到，唯一被「遮蔽」的
+///   情况是同一起点多个 pattern 同时命中——这正是锚定逐一确认要补回的部分。
+/// - Ac 路径：pattern i 在 s 处完整匹配 ⟹ 其最长字面量核心串必在 s+off_i 处出现
+///   ⟹ AC overlapping 扫描必然报告该核心命中（overlapping 迭代不遗漏任何位置）。
+///   候选验证用的是与原正则逐位置完全等价的碱基掩码（[ACGT]/[CT] 等字符类展开为
+///   位掩码，字面量为单 bit），通过验证 ⟺ 原正则在 s 处完整匹配。
+///
+/// 因此两条路径得到的命中集合都与旧版完全一致；同一起点多个 pattern 同时命中的
+/// 情况天然支持（每个 pattern 各自触发、各自验证）。
+///
+/// 输出顺序：旧版是「按 pattern 分组、组内按起点升序」。两条路径的原始命中都按
+/// 起点升序（AC 按终点升序，但同一 pattern 核心串定长，组内等价于起点升序）、
+/// pattern 交错；按 (pattern_idx, start) 排序后与旧版逐字节一致（下游按哈希去重
+/// 保留首次出现顺序，顺序必须保持一致）。
+fn find_all_tag_positions_into(
+    seq: &[u8],
+    enzyme: &EnzymeSpec,
+    hits: &mut Vec<(usize, usize, usize)>,
+    out: &mut Vec<(usize, usize)>,
+) {
+    hits.clear();
+    out.clear();
+    match &enzyme.scanner {
+        ScanMode::Regex { combined, anchored } => {
+            let mut pos = 0usize;
+            while pos <= seq.len() {
+                match combined.find_at(seq, pos) {
+                    Some(m) => {
+                        let mstart = m.start();
+                        let tail = &seq[mstart..];
+                        for (idx, (anch, &tag_len)) in
+                            anchored.iter().zip(&enzyme.pattern_tag_lengths).enumerate()
+                        {
+                            if anch.is_match(tail) {
+                                hits.push((idx, mstart, tag_len));
+                            }
+                        }
+                        pos = mstart + 1; // rewind: mirrors Perl's `pos($seq) = match_start + 1`
+                    }
+                    None => break,
                 }
-                None => break,
+            }
+        }
+        ScanMode::Ac {
+            ac,
+            masks,
+            core_off,
+            core2,
+        } => {
+            for m in ac.find_overlapping_iter(seq) {
+                let idx = m.pattern().as_usize();
+                let p = m.start();
+                let off1 = core_off[idx];
+                if p < off1 {
+                    continue;
+                }
+                let cand = p - off1;
+                let masks_i = &masks[idx];
+                let end = cand + masks_i.len();
+                if end > seq.len() {
+                    continue;
+                }
+                // 第二字面量段快速过滤（绝大多数候选在这里被拒绝）
+                if let Some((off2, c2)) = &core2[idx] {
+                    let s2 = cand + off2;
+                    if seq[s2..s2 + c2.len()] != c2[..] {
+                        continue;
+                    }
+                }
+                // 逐位置掩码验证，等价于原正则的定长窗口匹配
+                let window = &seq[cand..end];
+                if window
+                    .iter()
+                    .zip(masks_i.iter())
+                    .all(|(&b, &m)| m & BASE_BIT[b as usize] != 0)
+                {
+                    hits.push((idx, cand, enzyme.pattern_tag_lengths[idx]));
+                }
             }
         }
     }
-    out
+    // 归组排序：组内保持起点升序。
+    hits.sort_by_key(|&(idx, s, _)| (idx, s));
+    out.extend(hits.iter().map(|&(_, s, l)| (s, l)));
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -703,21 +1013,24 @@ fn process_fasta_sylph_style(
     
     let mut reader = reader.unwrap();
     let mut kmer_to_tag_table = FxHashSet::default();
-    
+    // 每条记录复用的缓冲区，避免 per-record 分配
+    let mut bufs = TagBufs::default();
+    let mut tags: Vec<(Hash, TagHash, u8)> = Vec::with_capacity(64);
+
     while let Some(record) = reader.next() {
         if record.is_ok() {
             let record = record.expect(&format!("Invalid record for file {} ", input.display()));
             let seq = record.seq();
             let seq_id = String::from_utf8_lossy(record.id());
-            
+
             stats.total_sequences += 1;
             stats.total_sequence_length += seq.len();
 
             // canonical tag 字节序列（用于写出 FASTA/FASTQ）
-            let tags = extract_canonical_tags(&seq, enzyme);
+            extract_canonical_tags_into(&seq, enzyme, &mut bufs, &mut tags);
 
             // 按照sylph的去重模式（现在使用canonical tags）
-            for (tag, _len) in tags {
+            for (_, tag, _len) in tags.drain(..) {
                 if kmer_to_tag_table.insert(tag.clone()) {
                     stats.total_tags += 1;
                     write_tags(&mut *writer, &seq_id, &[tag], format)?;
@@ -765,21 +1078,24 @@ fn process_fastq_sylph_style(
     
     let mut reader = reader.unwrap();
     let mut kmer_to_tag_table = FxHashSet::default();
-    
+    // 每条记录复用的缓冲区，避免 per-record 分配
+    let mut bufs = TagBufs::default();
+    let mut tags: Vec<(Hash, TagHash, u8)> = Vec::with_capacity(64);
+
     while let Some(record) = reader.next() {
         if record.is_ok() {
             let record = record.expect(&format!("Invalid record for file {} ", input.display()));
             let seq = record.seq();
             let seq_id = String::from_utf8_lossy(record.id());
-            
+
             stats.total_sequences += 1;
             stats.total_sequence_length += seq.len();
 
             // canonical tag 字节序列（用于写出 FASTA/FASTQ）
-            let tags = extract_canonical_tags(&seq, enzyme);
+            extract_canonical_tags_into(&seq, enzyme, &mut bufs, &mut tags);
 
             // 按照sylph的去重模式（现在使用canonical tags）
-            for (tag, _len) in tags {
+            for (_, tag, _len) in tags.drain(..) {
                 if kmer_to_tag_table.insert(tag.clone()) {
                     stats.total_tags += 1;
                     write_tags(&mut *writer, &seq_id, &[tag], format)?;
@@ -1145,31 +1461,71 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                 .unwrap_or("unknown")
                 .to_string();
 
-            let reader = fastq::Reader::new(create_reader(&input_path)?);
+            // needletail 自动识别 gzip 压缩与 fasta/fastq 格式。
+            // <2 字节的（空）文件旧版会得到 0 条记录，这里显式保持该行为。
             let mut stats = ExtractionStats::new();
+            if get_file_size_optimized(&input_path)? < 2 {
+                log_stats(stats, &enzyme);
+                continue;
+            }
+            let mut reader = parse_fastx_file(&input_path)
+                .context(format!("Failed to open reads file: {}", input_path.display()))?;
 
-            for result in reader.records() {
-                let record = result.context("Failed to read FASTQ record")?;
-                stats.total_sequences += 1;
-                stats.total_sequence_length += record.seq().len();
-
-                let tags = extract_canonical_tags(record.seq(), &enzyme);
-
-                for (i, (tag, tag_len)) in tags.iter().enumerate() {
-                    let id = format!("{}_tag{}", record.id(), i + 1);
-                    writeln!(fa_writer, ">{}\n{}", id, String::from_utf8_lossy(tag))
-                        .context("Failed to write FASTA record")?;
-
-                    all_sylsp_entries.push(SylspEntry {
-                        sequence_id: id,
-                        tag: hash_bytes(tag),
-                        tag_length: *tag_len,
-                        sample_source: file_stem.clone(),
-                        enzyme: enzyme.name.clone(),
-                    });
+            // 单文件内按 chunk 并行提取：串行解析（gzip 解压本身无法并行），
+            // 把一个 chunk 的 (id, seq) 拷出后由 rayon 并行做酶切扫描，
+            // indexed par_iter + collect 保证结果顺序与输入一致，
+            // 因此 fasta 与 .sylsp 输出与串行基线逐字节一致。
+            const READ_CHUNK: usize = 2048;
+            let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(READ_CHUNK);
+            'chunk_loop: loop {
+                chunk.clear();
+                while chunk.len() < READ_CHUNK {
+                    match reader.next() {
+                        Some(rec) => {
+                            let rec = rec.context("Failed to read FASTQ record")?;
+                            let seq = rec.seq();
+                            stats.total_sequences += 1;
+                            stats.total_sequence_length += seq.len();
+                            chunk.push((fastq_id(rec.id()).to_vec(), seq.into_owned()));
+                        }
+                        None => {
+                            if chunk.is_empty() {
+                                break 'chunk_loop;
+                            }
+                            break;
+                        }
+                    }
                 }
 
-                stats.total_tags += tags.len();
+                // 每条 read 产出：fasta 片段字节 + 对应的 sylsp 条目
+                let chunk_results: Vec<(Vec<u8>, Vec<SylspEntry>)> = chunk
+                    .par_iter()
+                    .map_init(TagBufs::default, |bufs, (id, seq)| {
+                        let mut tags: Vec<(Hash, TagHash, u8)> = Vec::with_capacity(8);
+                        extract_canonical_tags_into(seq, &enzyme, bufs, &mut tags);
+                        let id_lossy = String::from_utf8_lossy(id);
+                        let mut frag = Vec::new();
+                        let mut entries = Vec::with_capacity(tags.len());
+                        for (i, (h, tag, tag_len)) in tags.into_iter().enumerate() {
+                            let entry_id = format!("{}_tag{}", id_lossy, i + 1);
+                            let _ = writeln!(frag, ">{}\n{}", entry_id, String::from_utf8_lossy(&tag));
+                            entries.push(SylspEntry {
+                                sequence_id: entry_id,
+                                tag: h,
+                                tag_length: tag_len,
+                                sample_source: file_stem.clone(),
+                                enzyme: enzyme.name.clone(),
+                            });
+                        }
+                        (frag, entries)
+                    })
+                    .collect();
+
+                for (frag, entries) in chunk_results {
+                    stats.total_tags += entries.len();
+                    fa_writer.write_all(&frag).context("Failed to write FASTA record")?;
+                    all_sylsp_entries.extend(entries);
+                }
             }
 
             log_stats(stats, &enzyme);
@@ -1339,22 +1695,37 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown");
                 let file_stem = file_name.split('.').next().unwrap_or("unknown").to_string();
-                
-                let reader = fastq::Reader::new(create_reader(&input_path)?);
+
                 let mut sylsp_entries = Vec::new();
                 let mut stats = ExtractionStats::new();
 
-                for result in reader.records() {
-                    let record = result.context("Failed to read FASTQ record")?;
-                    stats.total_sequences += 1;
-                    stats.total_sequence_length += record.seq().len();
+                // <2 字节的（空）文件旧版会得到 0 条记录，保持该行为。
+                if get_file_size_optimized(&input_path)? < 2 {
+                    let mut global_stats = sample_stats.lock().unwrap();
+                    global_stats.insert(file_stem.clone(), stats.clone());
+                    log_stats(stats, &enzyme);
+                    return Ok((file_stem, sylsp_entries));
+                }
+                // needletail 自动识别 gzip 与 fasta/fastq 格式
+                let mut reader = parse_fastx_file(&input_path)
+                    .context(format!("Failed to open sample file: {}", input_path.display()))?;
 
-                    let tags = extract_tag_hashes(record.seq(), &enzyme);
+                // 每条 read 复用的缓冲区，避免 per-read 的 Vec/FxHashSet 分配
+                let mut bufs = TagBufs::default();
+                let mut tags: Vec<(Hash, u8)> = Vec::with_capacity(64);
+                while let Some(rec) = reader.next() {
+                    let rec = rec.context("Failed to read FASTQ record")?;
+                    let seq = rec.seq();
+                    stats.total_sequences += 1;
+                    stats.total_sequence_length += seq.len();
+
+                    extract_tag_hashes_into(&seq, &enzyme, &mut bufs, &mut tags);
                     stats.total_tags += tags.len();
 
+                    let id = String::from_utf8_lossy(fastq_id(rec.id()));
                     for (i, (tag, tag_len)) in tags.iter().enumerate() {
                         sylsp_entries.push(SylspEntry {
-                            sequence_id: format!("{}_tag{}", record.id(), i + 1),
+                            sequence_id: format!("{}_tag{}", id, i + 1),
                             tag: *tag,
                             tag_length: *tag_len,
                             sample_source: file_stem.clone(), // 用文件名去除扩展名作为样本名
@@ -1434,43 +1805,51 @@ fn process_fasta_to_syldb(
     // 预分配容量 - 估计每个序列平均产生50个标签
     let mut syldb_entries = Vec::with_capacity(100);
 
-    // 读取和处理 FASTA 记录
-    let reader = create_reader(input)?;
-    for record in fasta::Reader::new(reader).records() {
-        let record = record.context("Failed to read FASTA record")?;
-        let seq_len = record.seq().len();
-        stats.total_sequences += 1;
-        stats.total_sequence_length += seq_len;
+    // needletail 解析 FASTA（自动识别 gzip）；<2 字节的（空）文件按 0 条记录处理，
+    // 与旧版 rust-bio 行为一致。seq() 已去除换行，等价于 rust-bio 的多行拼接。
+    if get_file_size_optimized(input)? >= 2 {
+        let mut reader = parse_fastx_file(input)
+            .context(format!("Failed to open FASTA file: {}", input.display()))?;
+        // 每条 contig 复用的缓冲区，避免 per-record 的 Vec/FxHashSet 分配
+        let mut bufs = TagBufs::default();
+        let mut tag_items: Vec<(Hash, TagHash, u8)> = Vec::with_capacity(64);
+        while let Some(rec) = reader.next() {
+            let rec = rec.context("Failed to read FASTA record")?;
+            let seq = rec.seq();
+            stats.total_sequences += 1;
+            stats.total_sequence_length += seq.len();
 
-        // 提取 canonical tag 字节序列及其哈希；保留序列以支持 error-tolerant matching。
-        let tag_items = extract_canonical_tags(record.seq(), enzyme);
-        stats.total_tags += tag_items.len();
-        let mut tags = Vec::with_capacity(tag_items.len());
-        let mut tag_lengths = Vec::with_capacity(tag_items.len());
-        let mut tag_seqs = if store_tag_seqs {
-            Some(Vec::with_capacity(tag_items.len()))
-        } else {
-            None
-        };
-        for (tag, tag_len) in tag_items {
-            tags.push(hash_bytes(&tag));
-            tag_lengths.push(tag_len);
-            if let Some(seqs) = tag_seqs.as_mut() {
-                seqs.push(tag);
+            // 提取 canonical tag 字节序列及其哈希；保留序列以支持 error-tolerant matching。
+            // 哈希在去重时已算好，直接复用，不再二次 hash_bytes。
+            extract_canonical_tags_into(&seq, enzyme, &mut bufs, &mut tag_items);
+            stats.total_tags += tag_items.len();
+            let mut tags = Vec::with_capacity(tag_items.len());
+            let mut tag_lengths = Vec::with_capacity(tag_items.len());
+            let mut tag_seqs = if store_tag_seqs {
+                Some(Vec::with_capacity(tag_items.len()))
+            } else {
+                None
+            };
+            for (h, tag, tag_len) in tag_items.drain(..) {
+                tags.push(h);
+                tag_lengths.push(tag_len);
+                if let Some(seqs) = tag_seqs.as_mut() {
+                    seqs.push(tag);
+                }
             }
-        }
 
-        // 创建 syldb 条目
-        let entry = SyldbEntry {
-            sequence_id: record.id().to_string(),
-            tags,
-            tag_lengths,
-            genome_source: input.to_string_lossy().to_string(),
-            tag_uniqueness: None, // 初始时未标记，将由mark命令处理
-            tag_seqs,
-            enzyme: enzyme_name.clone(),
-        };
-        syldb_entries.push(entry);
+            // 创建 syldb 条目
+            let entry = SyldbEntry {
+                sequence_id: String::from_utf8_lossy(fasta_id(rec.id())).into_owned(),
+                tags,
+                tag_lengths,
+                genome_source: input.to_string_lossy().to_string(),
+                tag_uniqueness: None, // 初始时未标记，将由mark命令处理
+                tag_seqs,
+                enzyme: enzyme_name.clone(),
+            };
+            syldb_entries.push(entry);
+        }
     }
 
     // 注释掉生成单个.syldb文件的代码
@@ -1495,43 +1874,55 @@ fn process_paired_fastq_to_sylsp(
     enzyme: &EnzymeSpec,
     sample_source: &str,
 ) -> Result<Vec<(String, Hash, u8, String)>> {
-    let reader1 = fastq::Reader::new(create_reader(Path::new(input1))?);
-    let reader2 = fastq::Reader::new(create_reader(Path::new(input2))?);
+    // needletail 自动识别 gzip；<2 字节的（空）文件按 0 条记录处理，与旧版一致。
     let mut stats = ExtractionStats::new();
     let mut entries = Vec::new();
 
-    let mut iter1 = reader1.records();
-    let mut iter2 = reader2.records();
+    if get_file_size_optimized(Path::new(input1))? < 2 || get_file_size_optimized(Path::new(input2))? < 2 {
+        log_stats(stats, enzyme);
+        return Ok(entries);
+    }
+    let mut reader1 = parse_fastx_file(Path::new(input1))
+        .context(format!("Failed to open first pair file: {}", input1))?;
+    let mut reader2 = parse_fastx_file(Path::new(input2))
+        .context(format!("Failed to open second pair file: {}", input2))?;
+
+    // 每条 read 复用的缓冲区，避免 per-read 的 Vec/FxHashSet 分配
+    let mut bufs = TagBufs::default();
+    let mut tags1: Vec<(Hash, u8)> = Vec::with_capacity(8);
+    let mut tags2: Vec<(Hash, u8)> = Vec::with_capacity(8);
 
     loop {
-        let record1 = match iter1.next() {
+        let record1 = match reader1.next() {
             Some(Ok(r)) => r,
             Some(Err(e)) => return Err(anyhow::anyhow!("Error reading first pair: {}", e)),
             None => break,
         };
 
-        let record2 = match iter2.next() {
+        let record2 = match reader2.next() {
             Some(Ok(r)) => r,
             Some(Err(e)) => return Err(anyhow::anyhow!("Error reading second pair: {}", e)),
             None => break,
         };
 
-        let seq_len1 = record1.seq().len();
-        let seq_len2 = record2.seq().len();
+        let seq1 = record1.seq();
+        let seq2 = record2.seq();
         stats.total_sequences += 1;
-        stats.total_sequence_length += seq_len1 + seq_len2;
+        stats.total_sequence_length += seq1.len() + seq2.len();
 
-        // 每条 read 内 tag 已由 extract_tag_hashes 去重；read id + tag index 天然唯一，
+        // 每条 read 内 tag 已按哈希去重；read id + tag index 天然唯一，
         // 原先的 seen_pairs 集合永远不会命中重复，纯属浪费，已移除。
-        let tags1 = extract_tag_hashes(record1.seq(), enzyme);
-        let tags2 = extract_tag_hashes(record2.seq(), enzyme);
+        extract_tag_hashes_into(&seq1, enzyme, &mut bufs, &mut tags1);
+        extract_tag_hashes_into(&seq2, enzyme, &mut bufs, &mut tags2);
         stats.total_tags += tags1.len() + tags2.len();
 
+        let id1 = String::from_utf8_lossy(fastq_id(record1.id())).into_owned();
         for (i, (tag, tag_len)) in tags1.iter().enumerate() {
-            entries.push((format!("{}_{}", record1.id(), i + 1), *tag, *tag_len, sample_source.to_string()));
+            entries.push((format!("{}_{}", id1, i + 1), *tag, *tag_len, sample_source.to_string()));
         }
+        let id2 = String::from_utf8_lossy(fastq_id(record2.id())).into_owned();
         for (i, (tag, tag_len)) in tags2.iter().enumerate() {
-            entries.push((format!("{}_{}", record2.id(), i + 1), *tag, *tag_len, sample_source.to_string()));
+            entries.push((format!("{}_{}", id2, i + 1), *tag, *tag_len, sample_source.to_string()));
         }
     }
 
@@ -1565,6 +1956,78 @@ fn read_file_list(path: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧版逐 pattern 扫描实现，仅作为单趟扫描等价性测试的对照。
+    fn find_all_tag_positions_per_pattern(seq: &[u8], enzyme: &EnzymeSpec) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (pattern, &tag_len) in enzyme.patterns.iter().zip(&enzyme.pattern_tag_lengths) {
+            let mut start = 0usize;
+            while start <= seq.len() {
+                match pattern.find_at(seq, start) {
+                    Some(m) => {
+                        let mstart = m.start();
+                        out.push((mstart, tag_len));
+                        start = mstart + 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_single_pass_scan_matches_per_pattern() {
+        // 确定性伪随机序列（xorshift64*），覆盖多种长度
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // 说明：密集位点种子在下方通过对长随机序列的真实命中收集，
+        // 用于人为制造重叠/相邻命中，压力测试同起点与交错命中的归组顺序。
+
+        for enzyme_name in ["BcgI", "all"] {
+            let enzyme = EnzymeSpec::new(enzyme_name).unwrap();
+
+            // 1) 纯随机序列
+            for len in [0usize, 10, 33, 100, 1000, 5000] {
+                for _ in 0..20 {
+                    let seq: Vec<u8> = (0..len).map(|_| b"ACGT"[(next() % 4) as usize]).collect();
+                    assert_eq!(
+                        find_all_tag_positions_per_pattern(&seq, &enzyme),
+                        find_all_tag_positions(&seq, &enzyme),
+                        "enzyme={} len={}",
+                        enzyme_name,
+                        len
+                    );
+                }
+            }
+
+            // 2) 先扫一段长随机序列收集真实命中，再把命中片段密集拼接到新序列里，
+            //    人为制造大量（重叠/相邻）位点
+            let big: Vec<u8> = (0..20000).map(|_| b"ACGT"[(next() % 4) as usize]).collect();
+            let seeds = find_all_tag_positions_per_pattern(&big, &enzyme);
+            if !seeds.is_empty() {
+                let mut dense = Vec::new();
+                for &(s, l) in seeds.iter().take(200) {
+                    dense.extend_from_slice(&big[s..s + l]);
+                    // 随机回退 0..l-1 bp，使下一段与上一段（部分）重叠
+                    let back = (next() as usize) % l;
+                    dense.truncate(dense.len() - back.min(dense.len()));
+                }
+                assert_eq!(
+                    find_all_tag_positions_per_pattern(&dense, &enzyme),
+                    find_all_tag_positions(&dense, &enzyme),
+                    "enzyme={} dense",
+                    enzyme_name
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_process_fasta_to_syldb_tag_seqs_optional() {

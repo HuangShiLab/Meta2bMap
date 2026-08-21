@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use fxhash::{FxHashMap, FxHashSet};
+use fxhash::FxHashMap;
+use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 use std::{
     fs::File,
@@ -64,46 +65,62 @@ fn read_db_file(path: &Path) -> Result<Vec<SyldbEntry>> {
 
 /// 标记unique tags的核心逻辑
 fn mark_unique_tags(mut entries: Vec<SyldbEntry>) -> Result<Vec<SyldbEntry>> {
-    // 构建tag到基因组源的映射
-    let mut tag_to_genomes: FxHashMap<Hash, FxHashSet<String>> = FxHashMap::default();
-    
+    // genome_source 驻留（intern）为 u32 id，避免对每个 tag 克隆 String。
+    // uniqueness 语义是「该 tag 只出现在 1 个基因组」，因此 tag 的状态只需记录
+    // （首个基因组 id, 是否已见过第二个不同基因组），无需保存完整基因组集合。
+    let mut genome_ids: FxHashMap<&str, u32> = FxHashMap::default();
+    let mut next_gid = 0u32;
+    // tag -> (first_genome_id, seen_multiple_genomes)
+    let mut tag_state: FxHashMap<Hash, (u32, bool)> = FxHashMap::default();
+
     // 第一次遍历：收集所有tag和它们出现的基因组
     for entry in &entries {
+        let gid = *genome_ids
+            .entry(entry.genome_source.as_str())
+            .or_insert_with(|| {
+                let id = next_gid;
+                next_gid += 1;
+                id
+            });
         for tag in &entry.tags {
-            tag_to_genomes
-                .entry(tag.clone())
-                .or_insert_with(FxHashSet::default)
-                .insert(entry.genome_source.clone());
+            tag_state
+                .entry(*tag)
+                .and_modify(|(first, multi)| {
+                    if *first != gid {
+                        *multi = true;
+                    }
+                })
+                .or_insert((gid, false));
         }
     }
-    
-    println!("总共找到 {} 个唯一tags", tag_to_genomes.len());
-    
+
+    println!("总共找到 {} 个唯一tags", tag_state.len());
+
     // 计算unique tags数量
-    let unique_tag_count = tag_to_genomes
+    let unique_tag_count = tag_state
         .values()
-        .filter(|genomes| genomes.len() == 1)
+        .filter(|(_, multi)| !multi)
         .count();
-    
-    println!("其中 {} 个tags是unique的 ({:.2}%)", 
-        unique_tag_count, 
-        unique_tag_count as f64 / tag_to_genomes.len() as f64 * 100.0);
-    
-    // 第二次遍历：为每个entry标记其tags的uniqueness
-    for entry in &mut entries {
+
+    println!("其中 {} 个tags是unique的 ({:.2}%)",
+        unique_tag_count,
+        unique_tag_count as f64 / tag_state.len() as f64 * 100.0);
+
+    // 第二次遍历：为每个entry标记其tags的uniqueness（tag_state 只读，可安全并行）
+    entries.par_iter_mut().for_each(|entry| {
         let mut tag_uniqueness = Vec::with_capacity(entry.tags.len());
-        
+
         for tag in &entry.tags {
-            let is_unique = tag_to_genomes
+            let is_unique = tag_state
                 .get(tag)
-                .map(|genomes| genomes.len() == 1)
+                .map(|(_, multi)| !multi)
                 .unwrap_or(false);
             tag_uniqueness.push(is_unique);
         }
-        
+
         entry.tag_uniqueness = Some(tag_uniqueness);
-    }
-    
+    });
+
     Ok(entries)
 }
 

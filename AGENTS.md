@@ -25,7 +25,8 @@ The repository is located at `/Users/macstudio/meta2bmap`. It is a single Cargo 
 - **CLI parsing**: `clap` with derive macros.
 - **Parallelism**: `rayon` for data parallelism.
 - **Allocator**: `tikv-jemallocator` is set as the global allocator in `src/main.rs`.
-- **Sequence I/O**: `bio::io::{fasta,fastq}` and `needletail::parse_fastx_file`.
+- **Sequence I/O**: `needletail::parse_fastx_file` (all extract hot paths; `bio` is still a dependency but no longer used in `src/`).
+- **Enzyme site scanning**: single-pass scan in `extract.rs` — `regex::bytes` alternation for ≤8 patterns, `aho-corasick` (DFA, overlapping) + per-position base-mask verification for larger pattern sets.
 - **Compression**: `flate2` for gzip handling.
 - **Serialization**: `bincode` and `serde` for `.db`/`.sp`/`.syldb`/`.sylsp` files.
 - **Logging**: `log`, `env_logger`, and `simple_logger`.
