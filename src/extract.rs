@@ -2107,4 +2107,123 @@ mod tests {
         let recovered = p_detect_one_mismatch(a_mm, 30);
         assert!((recovered - c).abs() < 1e-6, "recovered={} != c={}", recovered, c);
     }
+
+    // ---- 多成员 gzip 回归测试 ----
+    // 历史 bug：旧实现用 flate2::GzDecoder 只读 gzip 第一个成员，
+    // `cat R1.gz R2.gz` 拼接的输入会静默丢掉后半部分 reads。
+    // 换成 needletail 后已修复，以下测试防止回归。
+
+    /// 将 data 单独压缩成一个 gzip 成员的字节流
+    fn gzip_member(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// 第 i 条含单个 BcgI 位点的 read：10bp + CGA + 6bp + TGC + 10bp = 32bp，
+    /// 可变区用 i 的四进制编码填充，保证每条 read 的 tag 唯一（避免全局去重干扰计数）。
+    fn bcgi_read(i: usize) -> String {
+        let b4 = |mut v: usize, len: usize| -> String {
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                s.push(b"ACGT"[v % 4] as char);
+                v /= 4;
+            }
+            s
+        };
+        format!("{}CGA{}TGC{}", b4(i, 10), b4(i, 6), b4(i.wrapping_add(12345), 10))
+    }
+
+    fn fastq_records(n: usize, offset: usize) -> String {
+        let mut s = String::new();
+        for i in 0..n {
+            let read = bcgi_read(offset + i);
+            s.push_str(&format!("@r{}\n{}\n+\n{}\n", offset + i, read, "~".repeat(read.len())));
+        }
+        s
+    }
+
+    /// 统计 extract 输出 FASTA 的 tag 条数（每条 tag 一行 header）
+    fn count_fa_tags(path: &Path) -> usize {
+        let content = std::fs::read_to_string(path).unwrap();
+        content.lines().filter(|l| l.starts_with('>')).count()
+    }
+
+    #[test]
+    fn test_multi_member_gzip_fastq_reads_all_members() {
+        let dir = std::env::temp_dir();
+        let n = 50;
+        let member1 = fastq_records(n, 0);
+        let member2 = fastq_records(n, 1000);
+        let enzyme = EnzymeSpec::new("BcgI").unwrap();
+
+        // 对照：两个单成员文件分别处理
+        let m1_path = dir.join("m2b_test_mm_m1.fq.gz");
+        let m2_path = dir.join("m2b_test_mm_m2.fq.gz");
+        std::fs::write(&m1_path, gzip_member(member1.as_bytes())).unwrap();
+        std::fs::write(&m2_path, gzip_member(member2.as_bytes())).unwrap();
+        let out1 = dir.join("m2b_test_mm_out1.fa");
+        let out2 = dir.join("m2b_test_mm_out2.fa");
+        process_fastq(&m1_path, &out1, &enzyme, "fa", false).unwrap();
+        process_fastq(&m2_path, &out2, &enzyme, "fa", false).unwrap();
+        let count1 = count_fa_tags(&out1);
+        let count2 = count_fa_tags(&out2);
+        assert_eq!(count1, n, "member1 应提取 {} 条 tag", n);
+        assert_eq!(count2, n, "member2 应提取 {} 条 tag", n);
+
+        // 被测：cat m1.gz m2.gz 的多成员文件必须读到两个成员
+        let mut cat_bytes = std::fs::read(&m1_path).unwrap();
+        cat_bytes.extend_from_slice(&std::fs::read(&m2_path).unwrap());
+        let cat_path = dir.join("m2b_test_mm_cat.fq.gz");
+        std::fs::write(&cat_path, &cat_bytes).unwrap();
+        let out_cat = dir.join("m2b_test_mm_outcat.fa");
+        process_fastq(&cat_path, &out_cat, &enzyme, "fa", false).unwrap();
+        let count_cat = count_fa_tags(&out_cat);
+        assert_eq!(
+            count_cat,
+            count1 + count2,
+            "多成员 gzip 只读到 {} 条 tag（期望 {}），疑似只读了第一个成员",
+            count_cat,
+            count1 + count2
+        );
+
+        for p in [&m1_path, &m2_path, &out1, &out2, &cat_path, &out_cat] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
+    #[test]
+    fn test_multi_member_gzip_fasta_reads_all_members() {
+        let dir = std::env::temp_dir();
+        let enzyme = EnzymeSpec::new("BcgI").unwrap();
+        // 每个成员一条“基因组”，各含 20 个 BcgI 位点
+        let genome = |offset: usize| -> String {
+            let mut s = String::from(">genome\n");
+            for i in 0..20 {
+                s.push_str(&bcgi_read(offset + i));
+            }
+            s.push('\n');
+            s
+        };
+        let m1 = gzip_member(genome(0).as_bytes());
+        let m2 = gzip_member(genome(100000).as_bytes());
+        let mut cat_bytes = m1.clone();
+        cat_bytes.extend_from_slice(&m2);
+        let cat_path = dir.join("m2b_test_mm_genomes.fa.gz");
+        std::fs::write(&cat_path, &cat_bytes).unwrap();
+        let out_base = dir.join("m2b_test_mm_genomes");
+
+        let sketches = process_fasta_to_syldb(&cat_path, &out_base, &enzyme, "fa", false, false).unwrap();
+        assert_eq!(sketches.len(), 2, "多成员 gzip FASTA 应读出 2 条基因组");
+        // 每条基因组至少 20 个 tag（read 拼接处可能偶然形成额外位点，故不取等号）
+        assert!(
+            sketches.iter().all(|g| g.tags.len() >= 20),
+            "每条基因组应至少有 20 个 tag，实际 {:?}",
+            sketches.iter().map(|g| g.tags.len()).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_file(&cat_path).ok();
+        std::fs::remove_file(out_base.with_extension("syldb")).ok();
+    }
 }
