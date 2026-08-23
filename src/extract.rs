@@ -578,6 +578,26 @@ fn extract_canonical_tags_into(
     }
 }
 
+/// `extract_canonical_tags_into` 的位置感知版本，额外返回每个（去重后）tag 在序列上的
+/// bp 偏移（首次出现位置）。仅数据库构建路径使用，样本路径不需要位置信息。
+fn extract_canonical_tags_pos_into(
+    seq: &[u8],
+    enzyme: &EnzymeSpec,
+    bufs: &mut TagBufs,
+    out: &mut Vec<(Hash, TagHash, u8, u32)>,
+) {
+    out.clear();
+    bufs.seen.clear();
+    find_all_tag_positions_into(seq, enzyme, &mut bufs.hits, &mut bufs.positions);
+    for &(offset, len) in &bufs.positions {
+        let n = canonicalize_into(&seq[offset..offset + len], &mut bufs.cbuf);
+        let h = hash_bytes(&bufs.cbuf[..n]);
+        if bufs.seen.insert(h) {
+            out.push((h, bufs.cbuf[..n].to_vec(), n as u8, offset as u32));
+        }
+    }
+}
+
 /// rust-bio fastq 的 `id()` 只在第一个空格处截断（tab 不截断，见 bio-1.6 fastq.rs
 /// `splitn(2, ' ')`），而 needletail 的 `id()` 返回完整 header 行。
 /// 统一按首个空格截断，保证切换解析器后 id 逐字节一致。
@@ -821,6 +841,89 @@ pub struct SyldbEntry {
     /// 旧版数据库不含此字段，反序列化时为空字符串。
     #[serde(default)]
     pub enzyme: String,
+    /// 每个 tag 在其序列（contig）上的 bp 偏移（首个出现位置），与 `tags` 一一对应。
+    /// 用于 anchor breadth/uniformity 置信度指标，也是向 TGT（Tag–Gap–Tag）
+    /// 有序锚点模型对齐的第一步。v1 格式数据库无此字段，读取时为 None。
+    #[serde(default)]
+    pub tag_positions: Option<Vec<u32>>,
+    /// 该 entry 对应序列（contig）的长度（bp）；0 表示未知（v1 格式数据库）。
+    #[serde(default)]
+    pub seq_len: u32,
+}
+
+// ---- .syldb 格式版本兼容 ----
+//
+// v2 起文件头带 magic，其后是 bincode 编码的 Vec<SyldbEntry>。
+// v1（无 magic）是 bincode 编码的旧版 Vec<SyldbEntryV1>（无 tag_positions/seq_len），
+// 读取时回退到旧 schema 并把新字段置为 None/0，保证既有数据库可直接加载
+// （此时 profile 的 anchor 置信度列输出 NA）。
+pub const SYLDB_MAGIC: &[u8; 8] = b"M2BDB\x00\x00\x02";
+
+/// v1 格式的条目 schema（不含 tag_positions/seq_len），仅用于旧库回退读取。
+/// （Serialize 仅供测试构造 v1 字节流。）
+#[derive(Serialize, Deserialize)]
+struct SyldbEntryV1 {
+    sequence_id: String,
+    tags: Vec<Hash>,
+    tag_lengths: Vec<u8>,
+    genome_source: String,
+    tag_uniqueness: Option<Vec<bool>>,
+    #[serde(default)]
+    tag_seqs: Option<Vec<TagHash>>,
+    #[serde(default)]
+    enzyme: String,
+}
+
+impl From<SyldbEntryV1> for SyldbEntry {
+    fn from(v1: SyldbEntryV1) -> Self {
+        SyldbEntry {
+            sequence_id: v1.sequence_id,
+            tags: v1.tags,
+            tag_lengths: v1.tag_lengths,
+            genome_source: v1.genome_source,
+            tag_uniqueness: v1.tag_uniqueness,
+            tag_seqs: v1.tag_seqs,
+            enzyme: v1.enzyme,
+            tag_positions: None,
+            seq_len: 0,
+        }
+    }
+}
+
+/// 写出 .syldb（v2：magic + bincode）。
+pub fn write_syldb<W: Write>(mut writer: W, entries: &[SyldbEntry]) -> Result<()> {
+    writer
+        .write_all(SYLDB_MAGIC)
+        .context("Failed to write syldb magic")?;
+    bincode::serialize_into(writer, entries).context("Failed to serialize syldb data")
+}
+
+/// 读取 .syldb，自动识别 v2（带 magic）与 v1（旧版无 magic）格式。
+pub fn read_syldb<R: Read>(mut reader: R) -> Result<Vec<SyldbEntry>> {
+    let mut magic = [0u8; 8];
+    if let Err(e) = reader.read_exact(&mut magic) {
+        // 不足 8 字节的文件既不是 v2 也不可能是有效的 v1（空 Vec 也要 8 字节长度前缀）
+        return Err(e).context("Failed to read syldb header (file too short)");
+    }
+    if &magic == SYLDB_MAGIC {
+        use bincode::Options;
+        let entries: Vec<SyldbEntry> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize_from(reader)
+            .context("Failed to deserialize v2 syldb payload")?;
+        return Ok(entries);
+    }
+    // v1：把 magic 字节拼回流再按旧 schema 解析。reject_trailing_bytes 要求恰好
+    // 消费整个流，误解析（非 syldb 的二进制文件）会迅速报错而不是错读。
+    use bincode::Options;
+    let chained = std::io::Cursor::new(magic.to_vec()).chain(reader);
+    let v1: Vec<SyldbEntryV1> = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize_from(chained)
+        .context("Failed to deserialize database file (unrecognized format; neither v2 magic nor legacy v1)")?;
+    Ok(v1.into_iter().map(SyldbEntry::from).collect())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1600,7 +1703,7 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                 .context(format!("Failed to create combined syldb file: {}", combined_syldb_path.display()))?;
             let combined_syldb_writer = BufWriter::new(combined_syldb_file);
             
-            bincode::serialize_into(combined_syldb_writer, &all_syldb_entries)
+            write_syldb(combined_syldb_writer, &all_syldb_entries)
                 .context("Failed to serialize combined syldb data")?;
         }
     }
@@ -1657,7 +1760,7 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                 .context(format!("Failed to create combined syldb file: {}", combined_syldb_path.display()))?;
             let combined_syldb_writer = BufWriter::new(combined_syldb_file);
             
-            bincode::serialize_into(combined_syldb_writer, &all_syldb_entries)
+            write_syldb(combined_syldb_writer, &all_syldb_entries)
                 .context("Failed to serialize combined syldb data")?;
         }
     }
@@ -1812,27 +1915,30 @@ fn process_fasta_to_syldb(
             .context(format!("Failed to open FASTA file: {}", input.display()))?;
         // 每条 contig 复用的缓冲区，避免 per-record 的 Vec/FxHashSet 分配
         let mut bufs = TagBufs::default();
-        let mut tag_items: Vec<(Hash, TagHash, u8)> = Vec::with_capacity(64);
+        let mut tag_items: Vec<(Hash, TagHash, u8, u32)> = Vec::with_capacity(64);
         while let Some(rec) = reader.next() {
             let rec = rec.context("Failed to read FASTA record")?;
             let seq = rec.seq();
             stats.total_sequences += 1;
             stats.total_sequence_length += seq.len();
 
-            // 提取 canonical tag 字节序列及其哈希；保留序列以支持 error-tolerant matching。
+            // 提取 canonical tag 字节序列及其哈希；保留序列以支持 error-tolerant matching，
+            // 保留 bp 位置以支持 anchor breadth/uniformity 置信度指标（TGT 对齐）。
             // 哈希在去重时已算好，直接复用，不再二次 hash_bytes。
-            extract_canonical_tags_into(&seq, enzyme, &mut bufs, &mut tag_items);
+            extract_canonical_tags_pos_into(&seq, enzyme, &mut bufs, &mut tag_items);
             stats.total_tags += tag_items.len();
             let mut tags = Vec::with_capacity(tag_items.len());
             let mut tag_lengths = Vec::with_capacity(tag_items.len());
+            let mut tag_positions = Vec::with_capacity(tag_items.len());
             let mut tag_seqs = if store_tag_seqs {
                 Some(Vec::with_capacity(tag_items.len()))
             } else {
                 None
             };
-            for (h, tag, tag_len) in tag_items.drain(..) {
+            for (h, tag, tag_len, pos) in tag_items.drain(..) {
                 tags.push(h);
                 tag_lengths.push(tag_len);
+                tag_positions.push(pos);
                 if let Some(seqs) = tag_seqs.as_mut() {
                     seqs.push(tag);
                 }
@@ -1847,6 +1953,8 @@ fn process_fasta_to_syldb(
                 tag_uniqueness: None, // 初始时未标记，将由mark命令处理
                 tag_seqs,
                 enzyme: enzyme_name.clone(),
+                tag_positions: Some(tag_positions),
+                seq_len: seq.len() as u32,
             };
             syldb_entries.push(entry);
         }
@@ -2225,5 +2333,86 @@ mod tests {
 
         std::fs::remove_file(&cat_path).ok();
         std::fs::remove_file(out_base.with_extension("syldb")).ok();
+    }
+
+    // ---- syldb v2 格式（位置索引 + magic）与 v1 回退 ----
+
+    #[test]
+    fn test_syldb_write_read_roundtrip_v2() {
+        let entry = SyldbEntry {
+            sequence_id: "g1".to_string(),
+            tags: vec![11, 22, 33],
+            tag_lengths: vec![32, 32, 32],
+            genome_source: "g1.fasta".to_string(),
+            tag_uniqueness: None,
+            tag_seqs: Some(vec![b"AAAA".to_vec(), b"CCCC".to_vec(), b"GGGG".to_vec()]),
+            enzyme: "BcgI".to_string(),
+            tag_positions: Some(vec![100, 2000, 5000]),
+            seq_len: 8000,
+        };
+        let mut buf = Vec::new();
+        write_syldb(&mut buf, std::slice::from_ref(&entry)).unwrap();
+        assert!(buf.starts_with(SYLDB_MAGIC), "v2 文件应以 magic 开头");
+
+        let back = read_syldb(std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].tags, entry.tags);
+        assert_eq!(back[0].tag_positions, entry.tag_positions);
+        assert_eq!(back[0].seq_len, entry.seq_len);
+        assert_eq!(back[0].enzyme, entry.enzyme);
+    }
+
+    #[test]
+    fn test_syldb_read_v1_fallback() {
+        // v1 字节流（无 magic、无 tag_positions/seq_len）必须可读，新字段置 None/0
+        let v1 = SyldbEntryV1 {
+            sequence_id: "g1".to_string(),
+            tags: vec![7, 8],
+            tag_lengths: vec![32, 32],
+            genome_source: "g1.fasta".to_string(),
+            tag_uniqueness: None,
+            tag_seqs: None,
+            enzyme: "BcgI".to_string(),
+        };
+        let buf = bincode::serialize(&vec![v1]).unwrap();
+        let back = read_syldb(std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].tags, vec![7, 8]);
+        assert!(back[0].tag_positions.is_none());
+        assert_eq!(back[0].seq_len, 0);
+    }
+
+    #[test]
+    fn test_process_fasta_to_syldb_stores_positions() {
+        let dir = std::env::temp_dir();
+        let fa_path = dir.join("m2b_test_pos.fa");
+        // 两条 contig，各含若干 BcgI 位点
+        let mut contig1 = String::new();
+        for i in 0..5 {
+            contig1.push_str(&bcgi_read(i));
+        }
+        let mut contig2 = String::new();
+        for i in 0..3 {
+            contig2.push_str(&bcgi_read(100 + i));
+        }
+        std::fs::write(
+            &fa_path,
+            format!(">c1\n{}\n>c2\n{}\n", contig1, contig2),
+        )
+        .unwrap();
+        let out_base = dir.join("m2b_test_pos");
+        let enzyme = EnzymeSpec::new("BcgI").unwrap();
+        let entries = process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, true).unwrap();
+        assert_eq!(entries.len(), 2);
+        for (e, expected_len) in entries.iter().zip([contig1.len(), contig2.len()]) {
+            let pos = e.tag_positions.as_ref().expect("v2 应存储位置");
+            assert_eq!(pos.len(), e.tags.len(), "位置与 tag 一一对应");
+            assert_eq!(e.seq_len as usize, expected_len, "seq_len 应为 contig 长度");
+            assert!(
+                pos.iter().all(|&p| (p as usize) < expected_len),
+                "位置必须落在 contig 内"
+            );
+        }
+        std::fs::remove_file(&fa_path).ok();
     }
 }

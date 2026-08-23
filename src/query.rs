@@ -15,7 +15,7 @@ pub fn query(args: QueryArgs) -> Result<()> {
     // 读取数据库文件
     let db_file = File::open(&args.db_file)?;
     let db_reader = BufReader::new(db_file);
-    let db_entries: Vec<crate::extract::SyldbEntry> = bincode::deserialize_from(db_reader)
+    let db_entries: Vec<crate::extract::SyldbEntry> = crate::extract::read_syldb(db_reader)
         .context("Failed to deserialize database file")?;
 
     println!("Debug: Found {} entries in database file", db_entries.len());

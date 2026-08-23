@@ -57,7 +57,7 @@ fn read_db_file(path: &Path) -> Result<Vec<SyldbEntry>> {
         .context(format!("无法打开文件: {}", path.display()))?;
     let reader = BufReader::new(file);
     
-    let entries: Vec<SyldbEntry> = bincode::deserialize_from(reader)
+    let entries: Vec<SyldbEntry> = crate::extract::read_syldb(reader)
         .context("无法反序列化db文件")?;
     
     Ok(entries)
@@ -188,7 +188,7 @@ fn write_db_file(path: &Path, entries: &[SyldbEntry]) -> Result<()> {
         .context(format!("无法创建文件: {}", path.display()))?;
     let writer = BufWriter::new(file);
     
-    bincode::serialize_into(writer, entries)
+    crate::extract::write_syldb(writer, entries)
         .context("无法序列化db数据")?;
     
     Ok(())
@@ -210,6 +210,8 @@ mod tests {
                 tag_uniqueness: None,
                 tag_seqs: None,
                 enzyme: "BcgI".to_string(),
+                tag_positions: None,
+                seq_len: 0,
             },
             SyldbEntry {
                 sequence_id: "seq2".to_string(),
@@ -219,6 +221,8 @@ mod tests {
                 tag_uniqueness: None,
                 tag_seqs: None,
                 enzyme: "BcgI".to_string(),
+                tag_positions: None,
+                seq_len: 0,
             },
         ];
         
