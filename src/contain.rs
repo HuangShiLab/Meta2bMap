@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::extract::GenomeSketch;
 pub use crate::extract::{
     ani_from_containment_one_mismatch, ani_from_containment_one_mismatch_err,
-    one_mismatch_canonical_hashes, SyldbEntry, SylspEntry, TagHash,
+    one_mismatch_canonical_hashes, read_syldb, SyldbEntry, SylspEntry, TagHash,
 };
 use crate::sketch::SequencesSketch;
 
@@ -134,6 +134,111 @@ pub struct GenomeProfileResult {
     pub common_tags: usize,
     pub total_tags: usize,
     pub eff_cov: f64,
+    /// anchor 覆盖置信度（v2 数据库带位置索引时计算；旧库/sketch 模式为 None）
+    pub anchor: Option<AnchorConfidence>,
+}
+
+/// anchor 覆盖置信度指标：命中 tag 在参考基因组坐标上的分布特征。
+/// 基于 TGT（Tag–Gap–Tag）思想：2bRAD tag 是固定位置的锚点，真实存在的基因组
+/// 其命中锚点应大致均匀地散布全基因组；局部扎堆的命中提示假阳性
+/// （如水平转移区域或局部相似），此时 breadth 低、gap_cv / max_gap_frac 高。
+#[derive(Debug, Clone)]
+pub struct AnchorConfidence {
+    /// 命中的锚点数
+    pub covered: usize,
+    /// 命中锚点的跨度占基因组长度的比例（0–1，越大越可信）
+    pub breadth: f64,
+    /// 相邻命中锚点间距的变异系数（CV）。均匀随机 ≈ 1，明显 >1 提示扎堆。
+    /// 命中锚点 <3 时无法估计，为 None。
+    pub gap_cv: Option<f64>,
+    /// 最大未覆盖区域（含两端边缘空档）占基因组长度的比例（越小越好）
+    pub max_gap_frac: f64,
+}
+
+/// 计算一个（基因组, 样本）对的 anchor 置信度。命中判定与 containment 完全同语义
+/// （exact 或经 `MismatchNeighborCache`/tag_seqs 的 1-mismatch 邻居查询）。
+/// 数据库无位置索引（v1 旧库、sketch 模式）时返回 None。
+fn anchor_confidence(
+    entry: &SyldbEntry,
+    entry_idx: usize,
+    sample_counts: &FxHashMap<Hash, u32>,
+    mismatch: usize,
+    neighbor_cache: Option<&MismatchNeighborCache>,
+) -> Option<AnchorConfidence> {
+    let positions = entry.tag_positions.as_ref()?;
+    if entry.seq_len == 0 || positions.len() != entry.tags.len() || entry.tags.is_empty() {
+        return None;
+    }
+    let mean_tag_len = if entry.tag_lengths.is_empty() {
+        0.0
+    } else {
+        entry.tag_lengths.iter().map(|&l| l as f64).sum::<f64>() / entry.tag_lengths.len() as f64
+    };
+    let mut covered: Vec<u32> = Vec::new();
+    for (i, &tag_hash) in entry.tags.iter().enumerate() {
+        let hit = match neighbor_cache {
+            Some(cache) => lookup_tag_coverage(
+                tag_hash,
+                cache.get(entry_idx, i),
+                sample_counts,
+                mismatch,
+            )
+            .is_some(),
+            None => lookup_tag_coverage_regen(
+                tag_hash,
+                entry.tag_seqs.as_ref().and_then(|s| s.get(i)),
+                sample_counts,
+                mismatch,
+            )
+            .is_some(),
+        };
+        if hit {
+            covered.push(positions[i]);
+        }
+    }
+    if covered.is_empty() {
+        return None;
+    }
+    covered.sort_unstable();
+    let m = covered.len();
+    let genome_len = entry.seq_len as f64;
+    let span = (covered[m - 1] - covered[0]) as f64 + mean_tag_len;
+    let breadth = (span / genome_len).clamp(0.0, 1.0);
+    // 未覆盖区域 = 相邻命中锚点间距 + 两端的边缘空档（5'端 0→首个命中、3'端 末个命中→L）。
+    // 边缘空档必须计入：命中扎堆在局部时，最大的未覆盖区域往往在两端。
+    let mut regions: Vec<f64> = Vec::with_capacity(m + 1);
+    regions.push(covered[0] as f64);
+    regions.extend(covered.windows(2).map(|w| (w[1] - w[0]) as f64));
+    regions.push((genome_len - covered[m - 1] as f64 - mean_tag_len).max(0.0));
+    let max_gap = regions.iter().cloned().fold(0.0f64, f64::max);
+    let max_gap_frac = (max_gap / genome_len).clamp(0.0, 1.0);
+    if m < 2 {
+        return Some(AnchorConfidence {
+            covered: m,
+            breadth,
+            gap_cv: None,
+            max_gap_frac,
+        });
+    }
+    // CV 只用相邻命中锚点间距（边缘空档长度依赖 contig 边界，不属于锚点分布本身）
+    let gaps = &regions[1..regions.len() - 1];
+    let gap_cv = if m >= 3 {
+        let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+        if mean > 0.0 {
+            let var = gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / gaps.len() as f64;
+            Some(var.sqrt() / mean)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(AnchorConfidence {
+        covered: m,
+        breadth,
+        gap_cv,
+        max_gap_frac,
+    })
 }
 
 // 新增：k-mer重新分配相关的结构体和函数
@@ -761,7 +866,7 @@ pub fn query(args: ContainArgs) -> Result<()> {
                 .map(genome_sketch_to_syldb_entry)
                 .collect()
         } else {
-            bincode::deserialize_from(db_reader)
+            read_syldb(db_reader)
                 .with_context(|| format!("Failed to deserialize database file: {}", db_path))?
         };
         // 关键：按基因组聚合所有 contig（去重 tag），避免逐 contig 碎片化
@@ -1310,6 +1415,8 @@ fn genome_sketch_to_syldb_entry(sketch: &GenomeSketch) -> SyldbEntry {
         tag_uniqueness: None,
         tag_seqs: None,
         enzyme: sketch_enzyme_tag(sketch.c, sketch.k),
+        tag_positions: None, // k-mer sketch 无位置信息，anchor 置信度输出 NA
+        seq_len: sketch.gn_size as u32,
     }
 }
 
@@ -1349,8 +1456,15 @@ fn sketch_sample_view(sketch: &SequencesSketch) -> (String, &FxHashMap<Hash, u32
 
 fn aggregate_db_by_genome(entries: Vec<SyldbEntry>) -> Vec<SyldbEntry> {
     let mut map: FxHashMap<String, SyldbEntry> = FxHashMap::default();
+    // 每个基因组的 TGT 式 contig 累计偏移：第 i 条 contig 的 tag 位置统一加上
+    // 之前所有 contig 长度之和，形成基因组级坐标。contig 到达顺序即 DB 文件顺序，确定。
+    let mut contig_offset: FxHashMap<String, u64> = FxHashMap::default();
+    // 任一 contig 缺位置信息（v1 旧库）则整个基因组的位置索引作废（None）
+    let mut pos_invalid: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in entries {
         let gid = extract_genome_id_from_path(&e.genome_source).to_string();
+        let off = *contig_offset.get(&gid).unwrap_or(&0);
+        contig_offset.insert(gid.clone(), off + e.seq_len as u64);
         let agg = map.entry(gid.clone()).or_insert_with(|| SyldbEntry {
             sequence_id: gid.clone(),
             tags: Vec::new(),
@@ -1359,7 +1473,21 @@ fn aggregate_db_by_genome(entries: Vec<SyldbEntry>) -> Vec<SyldbEntry> {
             tag_uniqueness: None,
             tag_seqs: None,
             enzyme: e.enzyme.clone(),
+            tag_positions: None,
+            seq_len: 0,
         });
+        agg.seq_len += e.seq_len;
+        match &e.tag_positions {
+            Some(pos) if !pos_invalid.contains(&gid) => {
+                agg.tag_positions
+                    .get_or_insert_with(Vec::new)
+                    .extend(pos.iter().map(|&p| (off + p as u64).min(u32::MAX as u64) as u32));
+            }
+            _ => {
+                pos_invalid.insert(gid.clone());
+                agg.tag_positions = None;
+            }
+        }
         agg.tags.extend(e.tags);
         agg.tag_lengths.extend(e.tag_lengths);
         if let Some(e_seqs) = e.tag_seqs.as_ref() {
@@ -1368,20 +1496,26 @@ fn aggregate_db_by_genome(entries: Vec<SyldbEntry>) -> Vec<SyldbEntry> {
     }
     let mut out: Vec<SyldbEntry> = map.into_values().collect();
     for e in &mut out {
-        // 按 (hash, length, seq) 去重，保证多酶模式下同一 hash 的不同长度 tag 不被错误合并
+        // 按 (hash, length, seq) 去重，保证多酶模式下同一 hash 的不同长度 tag 不被错误合并；
+        // 位置是随行数据（重复 tag 保留较小位置），不参与去重判定。
         let n = e.tags.len();
         let seqs = e.tag_seqs.as_ref().map(|s| s.as_slice());
-        let mut triples: Vec<(Hash, u8, TagHash)> = Vec::with_capacity(n);
+        let poss = e.tag_positions.as_ref().map(|p| p.as_slice());
+        let mut quads: Vec<(Hash, u8, TagHash, u32)> = Vec::with_capacity(n);
         for i in 0..n {
-            let seq = seqs.map(|s| s.get(i).cloned()).flatten().unwrap_or_default();
-            triples.push((e.tags[i], e.tag_lengths[i], seq));
+            let seq = seqs.and_then(|s| s.get(i).cloned()).unwrap_or_default();
+            let pos = poss.and_then(|p| p.get(i).copied()).unwrap_or(u32::MAX);
+            quads.push((e.tags[i], e.tag_lengths[i], seq, pos));
         }
-        triples.sort_unstable();
-        triples.dedup();
-        e.tags = triples.iter().map(|(h, _, _)| *h).collect();
-        e.tag_lengths = triples.iter().map(|(_, l, _)| *l).collect();
+        quads.sort_unstable_by(|a, b| (a.0, a.1, &a.2, a.3).cmp(&(b.0, b.1, &b.2, b.3)));
+        quads.dedup_by(|next, prev| next.0 == prev.0 && next.1 == prev.1 && next.2 == prev.2);
+        e.tags = quads.iter().map(|q| q.0).collect();
+        e.tag_lengths = quads.iter().map(|q| q.1).collect();
         if e.tag_seqs.is_some() {
-            e.tag_seqs = Some(triples.iter().map(|(_, _, s)| s.clone()).collect());
+            e.tag_seqs = Some(quads.iter().map(|q| q.2.clone()).collect());
+        }
+        if e.tag_positions.is_some() {
+            e.tag_positions = Some(quads.iter().map(|q| q.3).collect());
         }
     }
     out
@@ -1905,7 +2039,7 @@ pub fn query_single_file(sample_path: &str, db_path: &str, min_ani: f64, mismatc
     let db_file = File::open(db_path)
         .with_context(|| format!("Failed to open database file: {}", db_path))?;
     let db_reader = BufReader::new(db_file);
-    let db_entries: Vec<SyldbEntry> = bincode::deserialize_from(db_reader)
+    let db_entries: Vec<SyldbEntry> = read_syldb(db_reader)
         .with_context(|| format!("Failed to deserialize database file: {}", db_path))?;
 
     eprintln!("Found {} entries in database", db_entries.len());
@@ -2183,7 +2317,7 @@ fn strip_genome_extension(id: &str) -> Option<&str> {
 fn read_genome_mapping(db_path: &str) -> Result<FxHashMap<String, (String, String)>> {
     let db_file = File::open(db_path)?;
     let db_reader = BufReader::new(db_file);
-    let db_entries: Vec<SyldbEntry> = bincode::deserialize_from(db_reader)
+    let db_entries: Vec<SyldbEntry> = read_syldb(db_reader)
         .with_context(|| format!("Failed to deserialize database file: {}", db_path))?;
     
     // 并行处理数据库条目生成映射
@@ -2451,7 +2585,7 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
             .map(genome_sketch_to_syldb_entry)
             .collect()
     } else {
-        bincode::deserialize_from(db_reader)
+        read_syldb(db_reader)
             .with_context(|| format!("Failed to deserialize database file: {}", args.db_file))?
     };
     // 关键：按基因组聚合所有 contig（去重 tag），整个 profile 流程按"整基因组"统计
@@ -2763,6 +2897,7 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                                     common_tags: 0,
                                     total_tags: 0,
                                     eff_cov: 0.0,
+                                    anchor: None,
                                 }
                             });
 
@@ -2803,8 +2938,36 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
             .push(result);
     }
     
+    // anchor 置信度后处理所需的索引：结果中的 genome_id（= 基因组文件名，见
+    // build_genome_mapping_from_cache）→ 聚合 DB 条目下标；
+    // 样本来源 → tag 重数表（与 query 路径的 containment 判定同语义）。
+    let entry_idx_by_gid: FxHashMap<String, usize> = cached_db_entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let gid = std::path::Path::new(&e.genome_source)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| e.genome_source.clone());
+            (gid, i)
+        })
+        .collect();
+    let mut counts_by_source: FxHashMap<String, FxHashMap<Hash, u32>> = FxHashMap::default();
+    if !args.sketch_mode {
+        for entries in cached_sample_entries.values() {
+            for e in entries {
+                *counts_by_source
+                    .entry(e.sample_source.clone())
+                    .or_default()
+                    .entry(e.tag)
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
     // 采用 sylph 的简单策略 - 顺序计算丰度，避免复杂的并行迭代器组合
-    for (_sample_id, group) in sample_groups.iter_mut() {
+    for (sample_id, group) in sample_groups.iter_mut() {
         // 按ANI排序（参考sylph的排序机制）
         group.sort_by(|a, b| b.adjusted_ani.partial_cmp(&a.adjusted_ani).unwrap());
         
@@ -2816,6 +2979,22 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
             r.total_tags >= min_tags_genome &&
             r.eff_cov >= min_eff_coverage
         });
+
+        // anchor 置信度后处理：只对通过过滤的 (genome, sample) 对计算，开销可忽略。
+        // 数据库无位置索引（v1 旧库）或 sketch 模式时 anchor 保持 None，输出 NA。
+        if let Some(sample_counts) = counts_by_source.get(sample_id) {
+            for result in group.iter_mut() {
+                if let Some(&ei) = entry_idx_by_gid.get(&result.genome_id) {
+                    result.anchor = anchor_confidence(
+                        &cached_db_entries[ei],
+                        ei,
+                        sample_counts,
+                        args.mismatch,
+                        neighbor_cache.as_ref(),
+                    );
+                }
+            }
+        }
         
         // 计算总覆盖度，包括所有检测到的标签
         let total_genome_cov: f64 = group.iter()
@@ -2928,10 +3107,18 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
         writeln!(writer, "Sample files: {} files processed", sample_files.len())?;
         writeln!(writer, "Database file: {}", args.db_file)?;
         writeln!(writer, "\nGenome composition:")?;
-        writeln!(writer, "{:<30} {:<20} {:<10} {:<12} {:<12} {:<12} {:<12} {:<10}", 
-            "Genome_ID", "Sample_ID", "ANI(%)", "Tax_Abund(%)", "Seq_Abund(%)", "Common_Tags", "Total_Tags", "Eff_cov")?;
-        writeln!(writer, "{:-<110}", "")?;
-        
+        writeln!(writer, "{:<30} {:<20} {:<10} {:<12} {:<12} {:<12} {:<12} {:<10} {:<10} {:<10} {:<10}",
+            "Genome_ID", "Sample_ID", "ANI(%)", "Tax_Abund(%)", "Seq_Abund(%)", "Common_Tags", "Total_Tags", "Eff_cov", "Breadth", "GapCV", "MaxGap%")?;
+        writeln!(writer, "{:-<140}", "")?;
+
+        // anchor 置信度列的格式化：无位置索引（旧库/sketch 模式）时输出 NA
+        let fmt_anchor = |x: Option<f64>, scale: f64| -> String {
+            match x {
+                Some(v) => format!("{:.3}", v * scale),
+                None => "NA".to_string(),
+            }
+        };
+
         let mut current_genome = String::new();
         for result in final_results {
             if current_genome != result.genome_id {
@@ -2940,8 +3127,16 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                 }
                 current_genome = result.genome_id.clone();
             }
-            
-            writeln!(writer, "{:<30} {:<20} {:<10.2} {:<12.2} {:<12.2} {:<12} {:<12} {:<10.3}", 
+
+            let (breadth, gap_cv, max_gap) = match &result.anchor {
+                Some(a) => (
+                    fmt_anchor(Some(a.breadth), 1.0),
+                    fmt_anchor(a.gap_cv, 1.0),
+                    fmt_anchor(Some(a.max_gap_frac), 100.0),
+                ),
+                None => ("NA".to_string(), "NA".to_string(), "NA".to_string()),
+            };
+            writeln!(writer, "{:<30} {:<20} {:<10.2} {:<12.2} {:<12.2} {:<12} {:<12} {:<10.3} {:<10} {:<10} {:<10}",
                 result.genome_id,
                 result.sample_id,  // 使用实际的样本来源
                 result.adjusted_ani,
@@ -2949,7 +3144,10 @@ pub fn profile(args: ProfileArgs) -> Result<()> {
                 result.sequence_abundance,
                 result.common_tags,
                 result.total_tags,
-                result.eff_cov)?;
+                result.eff_cov,
+                breadth,
+                gap_cv,
+                max_gap)?;
         }
     }
     
@@ -3337,6 +3535,8 @@ mod tests {
             tag_uniqueness: None,
             tag_seqs: Some(tag_seqs),
             enzyme: "BcgI".to_string(),
+            tag_positions: None,
+            seq_len: 0,
         };
         let db = vec![entry];
         let e = estimate_read_error_rate(&db, &sample_counts, None);
@@ -3391,6 +3591,8 @@ mod tests {
                 tag_uniqueness: None,
                 tag_seqs: None,
                 enzyme: "BcgI".to_string(),
+                tag_positions: None,
+                seq_len: 0,
             }
         };
         let db = vec![
@@ -3541,5 +3743,85 @@ mod tests {
             !guarded.iter().any(|r| r.genome_file == "B.fasta"),
             "genome failing min-ani on pre-reassignment stats must not be protected"
         );
+    }
+
+    // ---- anchor 置信度（breadth/uniformity） ----
+
+    /// 构造带位置索引的单 entry；tags 用互异哈希避免聚合去重。
+    fn pos_entry(source: &str, seq_id: &str, tags: Vec<Hash>, pos: Vec<u32>, len: u32) -> SyldbEntry {
+        SyldbEntry {
+            sequence_id: seq_id.to_string(),
+            tag_lengths: vec![32u8; tags.len()],
+            tags,
+            genome_source: source.to_string(),
+            tag_uniqueness: None,
+            tag_seqs: None,
+            enzyme: "BcgI".to_string(),
+            tag_positions: Some(pos),
+            seq_len: len,
+        }
+    }
+
+    #[test]
+    fn test_aggregate_positions_cumulative_offsets() {
+        // 同一基因组的两条 contig：第二条的位置应整体偏移第一条的长度（TGT 式基因组坐标）
+        let c1 = pos_entry("/db/g1.fasta", "c1", vec![1, 2], vec![10, 500], 1000);
+        let c2 = pos_entry("/db/g1.fasta", "c2", vec![3], vec![20], 500);
+        let out = aggregate_db_by_genome(vec![c1, c2]);
+        assert_eq!(out.len(), 1);
+        let g = &out[0];
+        assert_eq!(g.seq_len, 1500, "基因组长度为 contig 长度之和");
+        let pos = g.tag_positions.as_ref().unwrap();
+        // 聚合后按 (hash,...) 排序，位置随 tag 走：tag 3 的位置应为 1000+20
+        let get = |t: Hash| {
+            let i = g.tags.iter().position(|&x| x == t).unwrap();
+            pos[i]
+        };
+        assert_eq!(get(1), 10);
+        assert_eq!(get(2), 500);
+        assert_eq!(get(3), 1020, "第二条 contig 的 tag 位置应偏移 1000");
+    }
+
+    #[test]
+    fn test_aggregate_positions_invalidated_by_v1_contig() {
+        // 任一 contig 缺位置（v1 旧库），整个基因组位置索引作废
+        let c1 = pos_entry("/db/g1.fasta", "c1", vec![1], vec![10], 1000);
+        let mut c2 = pos_entry("/db/g1.fasta", "c2", vec![2], vec![20], 500);
+        c2.tag_positions = None;
+        c2.seq_len = 0;
+        let out = aggregate_db_by_genome(vec![c1, c2]);
+        assert!(out[0].tag_positions.is_none());
+    }
+
+    #[test]
+    fn test_anchor_confidence_spread_vs_clustered() {
+        // 基因组：10 个锚点均匀分布在 10 kb 上
+        let tags: Vec<Hash> = (1u64..=10).collect();
+        let pos: Vec<u32> = (0..10).map(|i| i * 1000).collect();
+        let entry = pos_entry("g1.fasta", "g1", tags.clone(), pos, 10_000);
+
+        // 全命中（均匀散布）→ breadth 接近 1，最大间隙 ~10%
+        let all: FxHashMap<Hash, u32> = tags.iter().map(|&t| (t, 1)).collect();
+        let a = anchor_confidence(&entry, 0, &all, 0, None).unwrap();
+        assert_eq!(a.covered, 10);
+        assert!(a.breadth > 0.9, "spread breadth={}", a.breadth);
+        assert!(a.max_gap_frac < 0.15, "spread max_gap={}", a.max_gap_frac);
+        assert!(a.gap_cv.unwrap() < 0.2, "spread 等距锚点 CV 应接近 0");
+
+        // 只命中前 3 个（扎堆在 20% 区域）→ breadth 低、最大间隙大
+        let clustered: FxHashMap<Hash, u32> = tags[..3].iter().map(|&t| (t, 1)).collect();
+        let c = anchor_confidence(&entry, 0, &clustered, 0, None).unwrap();
+        assert_eq!(c.covered, 3);
+        assert!(c.breadth < 0.25, "clustered breadth={}", c.breadth);
+        assert!(c.max_gap_frac > 0.6, "clustered max_gap={}", c.max_gap_frac);
+
+        // 无位置索引（旧库）→ None
+        let mut legacy = entry.clone();
+        legacy.tag_positions = None;
+        assert!(anchor_confidence(&legacy, 0, &all, 0, None).is_none());
+
+        // 样本无命中 → None
+        let empty: FxHashMap<Hash, u32> = FxHashMap::default();
+        assert!(anchor_confidence(&entry, 0, &empty, 0, None).is_none());
     }
 }

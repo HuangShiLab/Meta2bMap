@@ -11,10 +11,11 @@ use crate::extract::SyldbEntry;
 
 /// Merge multiple .syldb database files into one .syldb.
 ///
-/// The .syldb format is a single bincode-serialized `Vec<SyldbEntry>` with no
-/// other header/framing, so merging is: deserialize each input, concatenate,
-/// serialize once. Entries are per-fasta-record; batches are assumed to contain
-/// disjoint genomes, so no deduplication is performed.
+/// The current .syldb format (v2) is an 8-byte magic header followed by a
+/// bincode-serialized `Vec<SyldbEntry>`; v1 files (no magic) are read via a
+/// compatibility fallback in `read_syldb`. Merging is: deserialize each input,
+/// concatenate, serialize once. Entries are per-fasta-record; batches are
+/// assumed to contain disjoint genomes, so no deduplication is performed.
 pub fn merge(args: MergeArgs) -> Result<()> {
     if args.inputs.len() < 2 {
         bail!("merge requires at least 2 input .syldb files");
@@ -31,7 +32,7 @@ pub fn merge(args: MergeArgs) -> Result<()> {
         let file = File::open(path)
             .with_context(|| format!("Failed to open input syldb file: {}", path.display()))?;
         let reader = BufReader::new(file);
-        let entries: Vec<SyldbEntry> = bincode::deserialize_from(reader)
+        let entries: Vec<SyldbEntry> = crate::extract::read_syldb(reader)
             .with_context(|| format!("Failed to deserialize syldb file: {}", path.display()))?;
 
         for e in &entries {
@@ -77,7 +78,7 @@ pub fn merge(args: MergeArgs) -> Result<()> {
     let out_file = File::create(out_path)
         .with_context(|| format!("Failed to create output syldb file: {}", out_path.display()))?;
     let writer = BufWriter::new(out_file);
-    bincode::serialize_into(writer, &all_entries)
+    crate::extract::write_syldb(writer, &all_entries)
         .context("Failed to serialize merged syldb data")?;
 
     eprintln!(
@@ -108,6 +109,8 @@ mod tests {
                 None
             },
             enzyme: enzyme.to_string(),
+            tag_positions: None,
+            seq_len: 0,
         }
     }
 
@@ -121,8 +124,8 @@ mod tests {
         let entries_a = vec![make_entry("g1", "BcgI", true), make_entry("g2", "BcgI", true)];
         let entries_b = vec![make_entry("g3", "BcgI", false)];
 
-        bincode::serialize_into(BufWriter::new(File::create(&p1).unwrap()), &entries_a).unwrap();
-        bincode::serialize_into(BufWriter::new(File::create(&p2).unwrap()), &entries_b).unwrap();
+        crate::extract::write_syldb(BufWriter::new(File::create(&p1).unwrap()), &entries_a).unwrap();
+        crate::extract::write_syldb(BufWriter::new(File::create(&p2).unwrap()), &entries_b).unwrap();
 
         let args = MergeArgs {
             inputs: vec![
@@ -134,7 +137,7 @@ mod tests {
         merge(args).unwrap();
 
         let merged: Vec<SyldbEntry> =
-            bincode::deserialize_from(BufReader::new(File::open(&pout).unwrap())).unwrap();
+            crate::extract::read_syldb(BufReader::new(File::open(&pout).unwrap())).unwrap();
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[0].sequence_id, "g1");
         assert_eq!(merged[1].sequence_id, "g2");
@@ -155,12 +158,12 @@ mod tests {
         let p2 = dir.join("m2b_merge_test_e2.syldb");
         let pout = dir.join("m2b_merge_test_eout.syldb");
 
-        bincode::serialize_into(
+        crate::extract::write_syldb(
             BufWriter::new(File::create(&p1).unwrap()),
             &vec![make_entry("g1", "BcgI", true)],
         )
         .unwrap();
-        bincode::serialize_into(
+        crate::extract::write_syldb(
             BufWriter::new(File::create(&p2).unwrap()),
             &vec![make_entry("g2", "BslFI", true)],
         )

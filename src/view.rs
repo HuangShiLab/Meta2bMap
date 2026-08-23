@@ -180,13 +180,21 @@ fn view_file(file_path: &str) -> Result<ViewResult> {
     let path = Path::new(file_path);
 
     match path.extension().and_then(|s| s.to_str()) {
-        Some("syldb") => view_syldb(deserialize_exact(file_path)?, file_path),
+        Some("syldb") => {
+            let reader = BufReader::new(File::open(path)?);
+            view_syldb(crate::extract::read_syldb(reader)?, file_path)
+        }
         Some("sylsp") => view_sylsp(deserialize_exact(file_path)?, file_path),
         // .db/.sp 既可能是 tag 格式（Vec<SyldbEntry>/Vec<SylspEntry>，如 .syldb/.sylsp 的
         // 改名或软链，query 使用），也可能是 sketch 格式（GenomeSketch/SequencesSketch）。
         // 用"完整消费文件"的严格反序列化探测：只有格式真正匹配才能成功。
         Some("db") => {
-            if let Ok(entries) = deserialize_exact::<Vec<crate::extract::SyldbEntry>>(file_path) {
+            // read_syldb 自动识别 v2（带 magic）与 v1（旧版无 magic）tag 格式
+            let tag_entries = File::open(path)
+                .ok()
+                .map(BufReader::new)
+                .and_then(|r| crate::extract::read_syldb(r).ok());
+            if let Some(entries) = tag_entries {
                 view_syldb(entries, file_path)
             } else {
                 view_db(BufReader::new(File::open(path)?), file_path)

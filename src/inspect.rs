@@ -189,7 +189,7 @@ fn inspect_file(file_path: &str) -> Result<InspectResult> {
 }
 
 fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult> {
-    let entries: Vec<crate::extract::SyldbEntry> = bincode::deserialize_from(reader)
+    let entries: Vec<crate::extract::SyldbEntry> = crate::extract::read_syldb(reader)
         .context("Failed to deserialize .db file")?;
 
     let mut tag_lengths = Vec::new();
