@@ -1,21 +1,19 @@
 use crate::cmdline::SketchArgs;
-use crate::extract::{
-    GenomeSketch, get_memory_usage,
-};
-use anyhow::{Result, Context, anyhow};
+use crate::extract::{get_memory_usage, GenomeSketch};
+use anyhow::{anyhow, Context, Result};
+use bincode;
 use fxhash::{FxHashMap, FxHashSet, FxHasher};
-use log::{info, warn, debug};
+use log::{debug, info, warn};
+use needletail::parse_fastx_file;
 use rayon::prelude::*;
+use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufWriter, BufReader, BufRead};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use needletail::parse_fastx_file;
-use scalable_cuckoo_filter::ScalableCuckooFilterBuilder;
-use bincode;
 
 pub type Hash = u64;
 pub type Kmer = u64;
@@ -23,22 +21,14 @@ type Marker = u32;
 
 // 从sylph复制的常量和函数
 pub(crate) const BYTE_TO_SEQ: [u8; 256] = [
-    0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
 ];
 
 const SAMPLE_FILE_SUFFIX: &str = ".sp";
@@ -129,7 +119,6 @@ pub fn extract_kmers_scalar(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k:
     let reverse_shift_dist = 2 * (k - 1);
     let mask = u64::MAX >> (std::mem::size_of::<u64>() * 8 - 2 * k);
     let rev_mask = !(3 << (2 * k - 2));
-    let len = string.len();
     let threshold = u64::MAX / (c as u64);
 
     // 初始化前 k-1 个核苷酸
@@ -146,18 +135,18 @@ pub fn extract_kmers_scalar(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k:
     }
 
     // 滑动窗口提取k-mers
-    for i in k - 1..len {
-        let nuc_byte = string[i] as usize;
+    for &nuc_byte in string.get(k - 1..).unwrap_or(&[]) {
+        let nuc_byte = nuc_byte as usize;
         let nuc_f = BYTE_TO_SEQ[nuc_byte] as u64;
         if nuc_f >= 4 {
             continue; // 跳过无效核苷酸
         }
         let nuc_r = 3 - nuc_f;
-        
+
         rolling_kmer_f <<= 2;
         rolling_kmer_f |= nuc_f;
         rolling_kmer_f &= mask;
-        
+
         rolling_kmer_r >>= 2;
         rolling_kmer_r &= rev_mask;
         rolling_kmer_r |= nuc_r << reverse_shift_dist;
@@ -168,9 +157,9 @@ pub fn extract_kmers_scalar(string: &[u8], kmer_vec: &mut Vec<u64>, c: usize, k:
         } else {
             rolling_kmer_r
         };
-        
+
         let hash_value = mm_hash64(canonical_kmer);
-        
+
         // 基于hash值进行采样
         if hash_value < threshold {
             kmer_vec.push(hash_value);
@@ -191,13 +180,7 @@ pub fn extract_kmers_positions(
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: 已检测到 AVX2 支持
         unsafe {
-            crate::avx2_seeding::extract_kmers_positions_avx2(
-                string,
-                kmer_vec,
-                c,
-                k,
-                contig_number,
-            )
+            crate::avx2_seeding::extract_kmers_positions_avx2(string, kmer_vec, c, k, contig_number)
         };
         return;
     }
@@ -222,7 +205,6 @@ pub fn extract_kmers_positions_scalar(
     let reverse_shift_dist = 2 * (k - 1);
     let mask = u64::MAX >> (std::mem::size_of::<u64>() * 8 - 2 * k);
     let rev_mask = !(3 << (2 * k - 2));
-    let len = string.len();
     let threshold = u64::MAX / (c as u64);
 
     // 初始化前 k-1 个核苷酸
@@ -239,18 +221,18 @@ pub fn extract_kmers_positions_scalar(
     }
 
     // 滑动窗口提取k-mers
-    for i in k - 1..len {
-        let nuc_byte = string[i] as usize;
+    for (i, &nuc_byte) in string.iter().enumerate().skip(k - 1) {
+        let nuc_byte = nuc_byte as usize;
         let nuc_f = BYTE_TO_SEQ[nuc_byte] as u64;
         if nuc_f >= 4 {
             continue; // 跳过无效核苷酸
         }
         let nuc_r = 3 - nuc_f;
-        
+
         rolling_kmer_f <<= 2;
         rolling_kmer_f |= nuc_f;
         rolling_kmer_f &= mask;
-        
+
         rolling_kmer_r >>= 2;
         rolling_kmer_r &= rev_mask;
         rolling_kmer_r |= nuc_r << reverse_shift_dist;
@@ -261,9 +243,9 @@ pub fn extract_kmers_positions_scalar(
         } else {
             rolling_kmer_r
         };
-        
+
         let hash_value = mm_hash64(canonical_kmer);
-        
+
         // 基于hash值进行采样
         if hash_value < threshold {
             kmer_vec.push((contig_number, i, hash_value));
@@ -319,7 +301,7 @@ fn dup_removal_exact(
     if let Some(t) = threshold {
         c_threshold = t;
     }
-    
+
     if !no_dedup && *c < c_threshold {
         if let Some(doublepairs) = kmer_pair {
             let mut ret = false;
@@ -351,14 +333,14 @@ fn dup_removal_exact(
 fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
     let k = std::mem::size_of::<Marker>() * 4;
     if s1.len() < 4 * k + 2 {
-        return None;
+        None
     } else {
         let mut kmer_f = 0;
         let mut kmer_g = 0;
         let mut kmer_r = 0;
         let mut kmer_t = 0;
         let halfway = s1.len() / 2;
-        
+
         for i in 0..k {
             let nuc_1 = BYTE_TO_SEQ[s1[2 * i] as usize] as Marker;
             let nuc_2 = BYTE_TO_SEQ[s1[2 * i + halfway] as usize] as Marker;
@@ -377,7 +359,7 @@ fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
             kmer_t <<= 2;
             kmer_t |= nuc_4;
         }
-        return Some(([kmer_f, kmer_r], [kmer_g, kmer_t]));
+        Some(([kmer_f, kmer_r], [kmer_g, kmer_t]))
     }
 }
 
@@ -386,13 +368,13 @@ fn pair_kmer_single(s1: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
 fn pair_kmer(s1: &[u8], s2: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
     let k = std::mem::size_of::<Marker>() * 4;
     if s1.len() < 2 * k + 1 || s2.len() < 2 * k + 1 {
-        return None;
+        None
     } else {
         let mut kmer_f = 0;
         let mut kmer_g = 0;
         let mut kmer_r = 0;
         let mut kmer_t = 0;
-        
+
         for i in 0..k {
             let nuc_1 = BYTE_TO_SEQ[s1[2 * i] as usize] as Marker;
             let nuc_2 = BYTE_TO_SEQ[s2[2 * i] as usize] as Marker;
@@ -411,12 +393,27 @@ fn pair_kmer(s1: &[u8], s2: &[u8]) -> Option<([Marker; 2], [Marker; 2])> {
             kmer_t <<= 2;
             kmer_t |= nuc_4;
         }
-        return Some(([kmer_f, kmer_r], [kmer_g, kmer_t]));
+        Some(([kmer_f, kmer_r], [kmer_g, kmer_t]))
     }
 }
 
 // 检查参数有效性
 fn check_args_valid(args: &SketchArgs) -> Result<()> {
+    if args.threads == 0 {
+        return Err(anyhow!("--threads must be greater than 0"));
+    }
+    if args.c == 0 {
+        return Err(anyhow!("--c-value must be greater than 0"));
+    }
+    if args.k == 0 || args.k > 31 {
+        return Err(anyhow!("--k-size must be between 1 and 31"));
+    }
+    if let Some(min_spacing) = args.min_spacing_kmer {
+        if min_spacing >= args.k {
+            return Err(anyhow!("--min-spacing must be smaller than --k-size"));
+        }
+    }
+
     let level = if args.trace {
         log::LevelFilter::Trace
     } else if args.debug {
@@ -430,10 +427,7 @@ fn check_args_valid(args: &SketchArgs) -> Result<()> {
         .build_global()
         .with_context(|| "Failed to initialize thread pool")?;
 
-    simple_logger::SimpleLogger::new()
-        .with_level(level)
-        .init()
-        .with_context(|| "Failed to initialize logger")?;
+    env_logger::Builder::new().filter_level(level).init();
 
     // 检查是否有输入文件
     if args.genomes.is_none()
@@ -447,7 +441,9 @@ fn check_args_valid(args: &SketchArgs) -> Result<()> {
         && args.list_sequence.is_none()
         && args.files.is_empty()
     {
-        return Err(anyhow!("No input sequences found; see meta2bmap sketch -h for help"));
+        return Err(anyhow!(
+            "No input sequences found; see meta2bmap sketch -h for help"
+        ));
     }
 
     if args.fpr < 0. || args.fpr >= 1. {
@@ -463,14 +459,14 @@ fn parse_line_file(file_name: &str) -> Result<Vec<String>> {
         .with_context(|| format!("Failed to open file list: {}", file_name))?;
     let reader = BufReader::new(file);
     let mut result = Vec::new();
-    
+
     for line in reader.lines() {
         let line = line.with_context(|| "Failed to read line from file list")?;
         if !line.trim().is_empty() {
             result.push(line.trim().to_string());
         }
     }
-    
+
     Ok(result)
 }
 
@@ -483,14 +479,14 @@ fn parse_genome_list_file(file_name: &str) -> Result<Vec<(String, String)>> {
         .with_context(|| format!("Failed to open genome list file: {}", file_name))?;
     let reader = BufReader::new(file);
     let mut result = Vec::new();
-    
+
     for line in reader.lines() {
         let line = line.with_context(|| "Failed to read line from genome list")?;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        
+
         if let Some(tab_pos) = line.find('\t') {
             // 两列格式: genome_id\tpath
             let genome_id = line[..tab_pos].trim().to_string();
@@ -509,7 +505,7 @@ fn parse_genome_list_file(file_name: &str) -> Result<Vec<(String, String)>> {
             result.push((genome_id, path));
         }
     }
-    
+
     Ok(result)
 }
 
@@ -520,7 +516,7 @@ fn parse_ambiguous_files(
     genome_inputs: &mut Vec<(String, String)>,
 ) -> Result<()> {
     let mut all_files = vec![];
-    
+
     if let Some(list_file) = &args.list_sequence {
         let files = parse_line_file(list_file)?;
         all_files.extend(files);
@@ -545,7 +541,7 @@ fn parse_ambiguous_files(
             );
         }
     }
-    
+
     Ok(())
 }
 
@@ -565,7 +561,7 @@ fn parse_reads_and_genomes(
             genome_inputs.push((genome_id, g.clone()));
         }
     }
-    
+
     if let Some(reads) = &args.reads {
         read_inputs.extend(reads.clone());
     }
@@ -577,10 +573,13 @@ fn parse_reads_and_genomes(
 
     if let Some(genome_list) = &args.genome_list {
         let genome_entries = parse_genome_list_file(genome_list)?;
-        info!("Parsed {} genomes from genome list file", genome_entries.len());
+        info!(
+            "Parsed {} genomes from genome list file",
+            genome_entries.len()
+        );
         genome_inputs.extend(genome_entries);
     }
-    
+
     Ok(())
 }
 
@@ -608,9 +607,11 @@ fn parse_paired_end_reads(
     }
 
     if first_pairs.len() != second_pairs.len() {
-        return Err(anyhow!("Different number of paired sequences after parsing lists"));
+        return Err(anyhow!(
+            "Different number of paired sequences after parsing lists"
+        ));
     }
-    
+
     Ok(())
 }
 
@@ -619,18 +620,18 @@ fn parse_sample_names(args: &SketchArgs) -> Result<Option<Vec<String>>> {
     if args.list_sample_names.is_none() && args.sample_names.is_none() {
         return Ok(None);
     }
-    
+
     let mut sample_names = Vec::new();
-    
+
     if let Some(file) = &args.list_sample_names {
         let names = parse_line_file(file)?;
         sample_names.extend(names);
     }
-    
+
     if let Some(names) = &args.sample_names {
         sample_names.extend(names.clone());
     }
-    
+
     Ok(Some(sample_names))
 }
 
@@ -645,7 +646,7 @@ pub fn sketch_sequences_needle(
     let mut kmer_map = HashMap::default();
     let reader = parse_fastx_file(read_file)
         .with_context(|| format!("Failed to parse fastx file: {}", read_file))?;
-    
+
     let mut mean_read_length = 0.;
     let mut counter = 0.;
     let mut kmer_to_pair_table = FxHashSet::default();
@@ -656,15 +657,15 @@ pub fn sketch_sequences_needle(
         let record = record.with_context(|| "Failed to read record")?;
         let mut vec = vec![];
         let seq = record.seq();
-        
+
         let kmer_pair = if seq.len() > 400 {
             None
         } else {
             pair_kmer_single(&seq)
         };
-        
+
         extract_kmers(&seq, &mut vec, c, k);
-        
+
         for km in vec {
             dup_removal_exact(
                 &mut kmer_map,
@@ -676,14 +677,15 @@ pub fn sketch_sequences_needle(
                 Some(MAX_DEDUP_COUNT),
             );
         }
-        
+
         // 计算移动平均
         counter += 1.;
         mean_read_length = mean_read_length + ((seq.len() as f64) - mean_read_length) / counter;
     }
 
-    let percent = (num_dup_removed as f64) / 
-        ((kmer_map.values().sum::<u32>() as f64) + num_dup_removed as f64) * 100.;
+    let percent = (num_dup_removed as f64)
+        / ((kmer_map.values().sum::<u32>() as f64) + num_dup_removed as f64)
+        * 100.;
     debug!(
         "Number of sketched k-mers removed due to read duplication for {}: {}. Percentage: {:.2}%",
         read_file, num_dup_removed, percent
@@ -714,15 +716,9 @@ pub fn sketch_pair_sequences(
         .with_context(|| format!("Failed to parse first pair file: {}", read_file1))?;
     let r2o = parse_fastx_file(read_file2)
         .with_context(|| format!("Failed to parse second pair file: {}", read_file2))?;
-    
-    let mut read_sketch = SequencesSketch::new(
-        read_file1.to_string(),
-        c,
-        k,
-        true,
-        sample_name,
-        0.0
-    );
+
+    let mut read_sketch =
+        SequencesSketch::new(read_file1.to_string(), c, k, true, sample_name, 0.0);
 
     let mut num_dup_removed = 0;
     let mut reader1 = r1o;
@@ -733,7 +729,7 @@ pub fn sketch_pair_sequences(
     if dedup_fpr != 0. {
         fpr = dedup_fpr;
     }
-    
+
     let mut _kmer_pair_set_approx = ScalableCuckooFilterBuilder::new()
         .initial_capacity(10_000_000)
         .false_positive_probability(fpr)
@@ -746,11 +742,11 @@ pub fn sketch_pair_sequences(
     loop {
         let n1 = reader1.next();
         let n2 = reader2.next();
-        
+
         if let (Some(rec1_o), Some(rec2_o)) = (n1, n2) {
             let rec1 = rec1_o.with_context(|| "Failed to read first pair record")?;
             let rec2 = rec2_o.with_context(|| "Failed to read second pair record")?;
-            
+
             let mut temp_vec1 = vec![];
             let mut temp_vec2 = vec![];
 
@@ -760,8 +756,8 @@ pub fn sketch_pair_sequences(
 
             // 计算移动平均
             counter += 1.;
-            mean_read_length = mean_read_length + 
-                ((rec1.seq().len() as f64) - mean_read_length) / counter;
+            mean_read_length =
+                mean_read_length + ((rec1.seq().len() as f64) - mean_read_length) / counter;
 
             for km in temp_vec1.iter() {
                 dup_removal_exact(
@@ -774,7 +770,7 @@ pub fn sketch_pair_sequences(
                     None,
                 );
             }
-            
+
             for km in temp_vec2.iter() {
                 if temp_vec1.contains(km) {
                     continue;
@@ -793,14 +789,15 @@ pub fn sketch_pair_sequences(
             break;
         }
     }
-    
-    let percent = (num_dup_removed as f64) / 
-        ((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64) * 100.;
+
+    let percent = (num_dup_removed as f64)
+        / ((read_sketch.kmer_counts.values().sum::<u32>() as f64) + num_dup_removed as f64)
+        * 100.;
     debug!(
         "Number of sketched k-mers removed due to read duplication for {}: {}. Percentage: {:.2}%",
         read_sketch.file_name, num_dup_removed, percent
     );
-    
+
     read_sketch.mean_read_length = mean_read_length;
     Ok(read_sketch)
 }
@@ -816,7 +813,7 @@ pub fn sketch_genome(
 ) -> Result<GenomeSketch> {
     let reader = parse_fastx_file(ref_file)
         .with_context(|| format!("Failed to parse genome file: {}", ref_file))?;
-    
+
     let mut vec = vec![];
     let mut pseudotax_track_kmers = vec![];
     let mut reader = reader;
@@ -888,7 +885,7 @@ pub fn sketch_genome(
             }
         }
     }
-    
+
     return_genome_sketch.genome_kmers = new_vec;
     Ok(return_genome_sketch)
 }
@@ -904,10 +901,10 @@ pub fn sketch_genome_individual(
 ) -> Result<Vec<GenomeSketch>> {
     let reader = parse_fastx_file(ref_file)
         .with_context(|| format!("Failed to parse genome file: {}", ref_file))?;
-    
+
     let mut reader = reader;
     let mut return_vec = vec![];
-    
+
     while let Some(record) = reader.next() {
         let record = record.with_context(|| "Failed to read genome record")?;
         let mut return_genome_sketch = GenomeSketch {
@@ -919,7 +916,7 @@ pub fn sketch_genome_individual(
             min_spacing,
             genome_kmers: Vec::new(),
         };
-        
+
         let mut pseudotax_track_kmers = vec![];
         let mut kmer_vec = vec![];
         let seq = record.seq();
@@ -964,7 +961,7 @@ pub fn sketch_genome_individual(
         return_genome_sketch.genome_kmers = new_vec;
         return_vec.push(return_genome_sketch);
     }
-    
+
     Ok(return_vec)
 }
 
@@ -976,24 +973,23 @@ fn generate_merged_sample_file(
     sample_names: &Option<Vec<String>>,
 ) -> Result<()> {
     let mut all_sketches = Vec::new();
-    
+
     // 读取所有单端reads的sketch文件
     for (i, read_file) in read_inputs.iter().enumerate() {
         let mut sample_name = None;
         if let Some(names) = sample_names {
             sample_name = Some(names[i + first_pairs.len()].clone());
         }
-        
-        let sketch_name = if sample_name.is_some() {
-            sample_name.as_ref().unwrap()
-        } else {
-            read_file
+
+        let sketch_name = match sample_name.as_ref() {
+            Some(name) => name,
+            None => read_file,
         };
-        
+
         let read_file_path = Path::new(sketch_name).file_name().unwrap();
         let file_path = Path::new(&args.sample_output_dir).join(read_file_path);
         let file_path_str = format!("{}{}", file_path.to_str().unwrap(), SAMPLE_FILE_SUFFIX);
-        
+
         if Path::new(&file_path_str).exists() {
             let file = File::open(&file_path_str)
                 .with_context(|| format!("Failed to open sketch file: {}", file_path_str))?;
@@ -1003,50 +999,61 @@ fn generate_merged_sample_file(
             all_sketches.push(sketch);
         }
     }
-    
+
     // 读取所有配对reads的sketch文件
     for (i, read_file1) in first_pairs.iter().enumerate() {
         let mut sample_name = None;
         if let Some(names) = sample_names {
             sample_name = Some(names[i].clone());
         }
-        
-        let sketch_name = if sample_name.is_some() {
-            sample_name.as_ref().unwrap()
-        } else {
-            read_file1
+
+        let sketch_name = match sample_name.as_ref() {
+            Some(name) => name,
+            None => read_file1,
         };
-        
+
         let read_file_path = Path::new(sketch_name).file_name().unwrap();
         let file_path = Path::new(&args.sample_output_dir).join(read_file_path);
-        let file_path_str = format!("{}.paired{}", file_path.to_str().unwrap(), SAMPLE_FILE_SUFFIX);
-        
+        let file_path_str = format!(
+            "{}.paired{}",
+            file_path.to_str().unwrap(),
+            SAMPLE_FILE_SUFFIX
+        );
+
         if Path::new(&file_path_str).exists() {
             let file = File::open(&file_path_str)
                 .with_context(|| format!("Failed to open paired sketch file: {}", file_path_str))?;
             let reader = BufReader::new(file);
-            let sketch: SequencesSketch = bincode::deserialize_from(reader)
-                .with_context(|| format!("Failed to deserialize paired sketch from: {}", file_path_str))?;
+            let sketch: SequencesSketch = bincode::deserialize_from(reader).with_context(|| {
+                format!(
+                    "Failed to deserialize paired sketch from: {}",
+                    file_path_str
+                )
+            })?;
             all_sketches.push(sketch);
         }
     }
-    
+
     if !all_sketches.is_empty() {
         // 创建合并的sketch文件
         let merged_name = args.out_name.as_deref().unwrap_or("merged_samples");
         let merged_file_path = Path::new(&args.sample_output_dir)
             .join(format!("{}{}", merged_name, SAMPLE_FILE_SUFFIX));
-        
-        let merged_file = File::create(&merged_file_path)
-            .with_context(|| format!("Failed to create merged sample file: {}", merged_file_path.display()))?;
+
+        let merged_file = File::create(&merged_file_path).with_context(|| {
+            format!(
+                "Failed to create merged sample file: {}",
+                merged_file_path.display()
+            )
+        })?;
         let mut writer = BufWriter::new(merged_file);
-        
+
         bincode::serialize_into(&mut writer, &all_sketches)
             .with_context(|| "Failed to serialize merged sample sketches")?;
-        
+
         info!("Merged sample file created: {}", merged_file_path.display());
     }
-    
+
     Ok(())
 }
 
@@ -1056,7 +1063,7 @@ fn generate_merged_genome_file(
     genome_inputs: &[(String, String)],
 ) -> Result<()> {
     let mut all_sketches = Vec::new();
-    
+
     // 读取所有基因组的sketch文件
     for (genome_id, _genome_file) in genome_inputs.iter() {
         if args.individual {
@@ -1065,13 +1072,22 @@ fn generate_merged_genome_file(
             loop {
                 let individual_path = Path::new(&args.output_dir)
                     .join(format!("{}_{}{}", genome_id, file_index, QUERY_FILE_SUFFIX));
-                
+
                 if individual_path.exists() {
-                    let file = File::open(&individual_path)
-                        .with_context(|| format!("Failed to open individual genome file: {}", individual_path.display()))?;
+                    let file = File::open(&individual_path).with_context(|| {
+                        format!(
+                            "Failed to open individual genome file: {}",
+                            individual_path.display()
+                        )
+                    })?;
                     let reader = BufReader::new(file);
                     let sketches: Vec<GenomeSketch> = bincode::deserialize_from(reader)
-                        .with_context(|| format!("Failed to deserialize individual genome sketch from: {}", individual_path.display()))?;
+                        .with_context(|| {
+                            format!(
+                                "Failed to deserialize individual genome sketch from: {}",
+                                individual_path.display()
+                            )
+                        })?;
                     all_sketches.extend(sketches);
                     file_index += 1;
                 } else {
@@ -1079,36 +1095,49 @@ fn generate_merged_genome_file(
                 }
             }
         } else {
-            let individual_path = Path::new(&args.output_dir)
-                .join(format!("{}{}", genome_id, QUERY_FILE_SUFFIX));
-            
+            let individual_path =
+                Path::new(&args.output_dir).join(format!("{}{}", genome_id, QUERY_FILE_SUFFIX));
+
             if individual_path.exists() {
-                let file = File::open(&individual_path)
-                    .with_context(|| format!("Failed to open genome file: {}", individual_path.display()))?;
+                let file = File::open(&individual_path).with_context(|| {
+                    format!("Failed to open genome file: {}", individual_path.display())
+                })?;
                 let reader = BufReader::new(file);
-                let sketches: Vec<GenomeSketch> = bincode::deserialize_from(reader)
-                    .with_context(|| format!("Failed to deserialize genome sketch from: {}", individual_path.display()))?;
+                let sketches: Vec<GenomeSketch> =
+                    bincode::deserialize_from(reader).with_context(|| {
+                        format!(
+                            "Failed to deserialize genome sketch from: {}",
+                            individual_path.display()
+                        )
+                    })?;
                 all_sketches.extend(sketches);
             }
         }
     }
-    
+
     if !all_sketches.is_empty() {
         // 创建合并的数据库文件
         let merged_name = args.out_name.as_deref().unwrap_or("merged_database");
-        let merged_file_path = Path::new(&args.output_dir)
-            .join(format!("{}{}", merged_name, QUERY_FILE_SUFFIX));
-        
-        let merged_file = File::create(&merged_file_path)
-            .with_context(|| format!("Failed to create merged genome database file: {}", merged_file_path.display()))?;
+        let merged_file_path =
+            Path::new(&args.output_dir).join(format!("{}{}", merged_name, QUERY_FILE_SUFFIX));
+
+        let merged_file = File::create(&merged_file_path).with_context(|| {
+            format!(
+                "Failed to create merged genome database file: {}",
+                merged_file_path.display()
+            )
+        })?;
         let mut writer = BufWriter::new(merged_file);
-        
+
         bincode::serialize_into(&mut writer, &all_sketches)
             .with_context(|| "Failed to serialize merged genome sketches")?;
-        
-        info!("Merged genome database file created: {}", merged_file_path.display());
+
+        info!(
+            "Merged genome database file created: {}",
+            merged_file_path.display()
+        );
     }
-    
+
     Ok(())
 }
 
@@ -1166,7 +1195,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
     if !first_pairs.is_empty() && !second_pairs.is_empty() {
         info!("Sketching paired sequences...");
         let iter_vec: Vec<usize> = (0..first_pairs.len()).collect();
-        
+
         iter_vec.into_par_iter().try_for_each(|i| -> Result<()> {
             let read_file1 = &first_pairs[i];
             let read_file2 = &second_pairs[i];
@@ -1175,7 +1204,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
             if let Some(names) = &sample_names {
                 sample_name = Some(names[i].clone());
             }
-            
+
             let read_sketch = sketch_pair_sequences(
                 read_file1,
                 read_file2,
@@ -1187,9 +1216,10 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
             )?;
 
             // 创建输出目录
-            fs::create_dir_all(&args.sample_output_dir)
-                .with_context(|| format!("Could not create directory at {}", args.sample_output_dir))?;
-            
+            fs::create_dir_all(&args.sample_output_dir).with_context(|| {
+                format!("Could not create directory at {}", args.sample_output_dir)
+            })?;
+
             let pref = Path::new(&args.sample_output_dir);
             let sketch_name = if sample_name.is_some() {
                 read_sketch.sample_name.as_ref().unwrap()
@@ -1200,17 +1230,21 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
             // 生成单个配对文件的子文件
             let read_file_path = Path::new(sketch_name).file_name().unwrap();
             let file_path = pref.join(read_file_path);
-            let file_path_str = format!("{}.paired{}", file_path.to_str().unwrap(), SAMPLE_FILE_SUFFIX);
+            let file_path_str = format!(
+                "{}.paired{}",
+                file_path.to_str().unwrap(),
+                SAMPLE_FILE_SUFFIX
+            );
 
             let mut read_sk_file = BufWriter::new(
                 File::create(&file_path_str)
-                    .with_context(|| format!("Failed to create file: {}", file_path_str))?
+                    .with_context(|| format!("Failed to create file: {}", file_path_str))?,
             );
 
             bincode::serialize_into(&mut read_sk_file, &read_sketch)
                 .with_context(|| "Failed to serialize paired read sketch")?;
             info!("Individual sketching {} complete.", file_path_str);
-            
+
             Ok(())
         })?;
     }
@@ -1219,7 +1253,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
     if !read_inputs.is_empty() {
         info!("Sketching non-paired sequences...");
         let iter_vec: Vec<usize> = (0..read_inputs.len()).collect();
-        
+
         iter_vec.into_par_iter().try_for_each(|i| -> Result<()> {
             let pref = Path::new(&args.sample_output_dir);
             fs::create_dir_all(pref)
@@ -1227,7 +1261,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
 
             let read_file = &read_inputs[i];
             check_vram_and_block(max_ram, read_file);
-            
+
             let mut sample_name = None;
             if let Some(names) = &sample_names {
                 sample_name = Some(names[i + first_pairs.len()].clone());
@@ -1246,7 +1280,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
             } else {
                 &read_sketch.file_name
             };
-            
+
             // 生成单个文件的子文件
             let read_file_path = Path::new(sketch_name).file_name().unwrap();
             let file_path = pref.join(read_file_path);
@@ -1254,13 +1288,13 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
 
             let mut read_sk_file = BufWriter::new(
                 File::create(&file_path_str)
-                    .with_context(|| format!("Failed to create file: {}", file_path_str))?
+                    .with_context(|| format!("Failed to create file: {}", file_path_str))?,
             );
 
             bincode::serialize_into(&mut read_sk_file, &read_sketch)
                 .with_context(|| "Failed to serialize read sketch")?;
             info!("Individual sketching {} complete.", file_path_str);
-            
+
             Ok(())
         })?;
     }
@@ -1278,7 +1312,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
 
         iter_vec.into_par_iter().try_for_each(|i| -> Result<()> {
             let (ref genome_id, ref genome_file) = genome_inputs[i];
-            
+
             if args.individual {
                 let mut indiv_gn_sketches = sketch_genome_individual(
                     args.c,
@@ -1347,7 +1381,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
 
             let mut c = counter.lock().unwrap();
             *c += 1;
-            if *c % 100 == 0 && *c != 0 {
+            if *c != 0 && *c % 100 == 0 {
                 info!("{} genomes processed.", *c);
             }
 
@@ -1361,7 +1395,7 @@ pub fn sketch(args: SketchArgs) -> Result<()> {
         generate_merged_sample_file(&args, &read_inputs, &first_pairs, &sample_names)?;
     }
 
-    // 生成合并的基因组数据库文件  
+    // 生成合并的基因组数据库文件
     if !genome_inputs.is_empty() {
         info!("Generating merged genome database file...");
         generate_merged_genome_file(&args, &genome_inputs)?;
@@ -1515,7 +1549,7 @@ mod tests {
                 // 中间含 N（N 被跳过，滚动窗口跨 N 延续——复现标量语义）
                 let mut s = rand(400, 10);
                 s.insert_str(100, "NNN");
-                s.insert_str(250, "n");
+                s.insert(250, 'n');
                 s
             }),
             (200, 31, {
@@ -1534,7 +1568,8 @@ mod tests {
             extract_kmers_scalar(seq.as_bytes(), &mut scalar_vec, *c, *k);
             simd_extract_kmers(seq.as_bytes(), &mut simd_vec, *c, *k);
             assert_eq!(
-                scalar_vec, simd_vec,
+                scalar_vec,
+                simd_vec,
                 "extract_kmers mismatch: c={}, k={}, seq_len={}",
                 c,
                 k,
@@ -1546,7 +1581,8 @@ mod tests {
             extract_kmers_positions_scalar(seq.as_bytes(), &mut scalar_pos, *c, *k, 3);
             simd_extract_kmers_positions(seq.as_bytes(), &mut simd_pos, *c, *k, 3);
             assert_eq!(
-                scalar_pos, simd_pos,
+                scalar_pos,
+                simd_pos,
                 "extract_kmers_positions mismatch: c={}, k={}, seq_len={}",
                 c,
                 k,

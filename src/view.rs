@@ -1,17 +1,17 @@
 // src/view.rs
 
 use crate::cmdline::ViewArgs;
-use crate::sketch::SequencesSketch;
+use crate::constants::Hash;
 use crate::extract::GenomeSketch;
+use crate::sketch::SequencesSketch;
 use anyhow::{Context, Result};
 use bincode;
 use bincode::Options;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
-use std::collections::HashMap;
-use crate::constants::Hash;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ViewResult {
@@ -28,7 +28,8 @@ struct ViewResult {
     genome_sources: Option<Vec<String>>,
     sample_sources: Option<Vec<SampleStats>>,
     // 每个样本对应的 kmer -> 计数
-    per_sample_kmer_counts: Option<std::collections::HashMap<String, std::collections::HashMap<Hash, u32>>>,
+    per_sample_kmer_counts:
+        Option<std::collections::HashMap<String, std::collections::HashMap<Hash, u32>>>,
     kmer_lengths: Vec<usize>,
     kmer_length_distribution: Vec<(usize, usize, f64)>,
     min_spacing: Option<usize>,
@@ -86,7 +87,7 @@ pub fn view(args: ViewArgs) -> Result<()> {
                 }
                 writeln!(writer, "C-value: {}", result.c)?;
                 writeln!(writer, "K-size: {}", result.k)?;
-                
+
                 // 样本有无与数量（若存在多个sample则按sample显示数量）
                 match &result.sample_sources {
                     Some(samples) if !samples.is_empty() => {
@@ -102,30 +103,39 @@ pub fn view(args: ViewArgs) -> Result<()> {
                 }
                 writeln!(writer, "Total k-mers: {}", result.total_kmers)?;
                 writeln!(writer, "Unique k-mers: {}", result.unique_kmers)?;
-                
+
                 if let Some(mean_length) = result.mean_read_length {
                     writeln!(writer, "Mean read length: {:.2}", mean_length)?;
                 }
-                
+
                 writeln!(writer, "\nK-mer Frequency Statistics:")?;
                 writeln!(writer, "---------------------------")?;
                 writeln!(writer, "{:<20} {:<10}", "K-mer Hash", "Count")?;
                 writeln!(writer, "{:-<30}", "")?;
-                
+
                 // 显示前20个最常见的k-mer
                 let display_count = std::cmp::min(20, result.kmer_frequency_stats.len());
                 for (kmer_hash, count) in result.kmer_frequency_stats.iter().take(display_count) {
-                    writeln!(writer, "{:<20} {:<10}", format!("{:016x}", kmer_hash), count)?;
+                    writeln!(
+                        writer,
+                        "{:<20} {:<10}",
+                        format!("{:016x}", kmer_hash),
+                        count
+                    )?;
                 }
                 if result.kmer_frequency_stats.len() > display_count {
-                    writeln!(writer, "... and {} more unique k-mers", result.kmer_frequency_stats.len() - display_count)?;
+                    writeln!(
+                        writer,
+                        "... and {} more unique k-mers",
+                        result.kmer_frequency_stats.len() - display_count
+                    )?;
                 }
-                
+
                 writeln!(writer, "\nK-mer Length Distribution:")?;
                 writeln!(writer, "-------------------------")?;
                 writeln!(writer, "{:<10} {:<10}", "Length", "Count")?;
                 writeln!(writer, "{:-<20}", "")?;
-                
+
                 for (length, count, _) in &result.kmer_length_distribution {
                     writeln!(writer, "{:<10} {:<10}", length, count)?;
                 }
@@ -139,7 +149,11 @@ pub fn view(args: ViewArgs) -> Result<()> {
                         writeln!(writer, "  Total k-mers: {}", sample.total_kmers)?;
                         writeln!(writer, "  K-mer length distribution:")?;
                         for (length, count, percentage) in &sample.kmer_length_distribution {
-                            writeln!(writer, "    Length {}: {} k-mers ({:.2}%)", length, count, percentage)?;
+                            writeln!(
+                                writer,
+                                "    Length {}: {} k-mers ({:.2}%)",
+                                length, count, percentage
+                            )?;
                         }
                     }
                 }
@@ -207,7 +221,9 @@ fn view_file(file_path: &str) -> Result<ViewResult> {
                 view_sp(BufReader::new(File::open(path)?), file_path)
             }
         }
-        _ => Err(anyhow::anyhow!("Unknown file extension, expected .db/.syldb or .sp/.sylsp")),
+        _ => Err(anyhow::anyhow!(
+            "Unknown file extension, expected .db/.syldb or .sp/.sylsp"
+        )),
     }
 }
 
@@ -216,11 +232,16 @@ fn view_file(file_path: &str) -> Result<ViewResult> {
 fn deserialize_exact<T: serde::de::DeserializeOwned>(file_path: &str) -> Result<T> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
-    Ok(bincode::DefaultOptions::new()
+    bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
         .deserialize_from(reader)
-        .with_context(|| format!("Failed to deserialize {} (format mismatch or truncated file)", file_path))?)
+        .with_context(|| {
+            format!(
+                "Failed to deserialize {} (format mismatch or truncated file)",
+                file_path
+            )
+        })
 }
 
 /// 取条目里非空酶字符串的众数（自描述格式的酶信息）。
@@ -231,7 +252,10 @@ fn modal_enzyme<'a>(enzymes: impl Iterator<Item = &'a str>) -> Option<String> {
             *counts.entry(e).or_insert(0) += 1;
         }
     }
-    counts.into_iter().max_by_key(|(_, c)| *c).map(|(e, _)| e.to_string())
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(e, _)| e.to_string())
 }
 
 fn view_syldb(entries: Vec<crate::extract::SyldbEntry>, file_path: &str) -> Result<ViewResult> {
@@ -279,7 +303,7 @@ fn view_syldb(entries: Vec<crate::extract::SyldbEntry>, file_path: &str) -> Resu
     let distribution = calculate_kmer_distribution(&tag_lengths);
     let unique_kmers = tag_frequency.len();
     let mut kmer_frequency_stats: Vec<(Hash, u32)> = tag_frequency.into_iter().collect();
-    kmer_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1));
+    kmer_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
 
     Ok(ViewResult {
         file_type: "TagDatabase".to_string(),
@@ -323,21 +347,24 @@ fn view_sylsp(entries: Vec<crate::extract::SylspEntry>, file_path: &str) -> Resu
 
         let sample_entry = per_sample_tag_counts
             .entry(entry.sample_source.clone())
-            .or_insert_with(HashMap::new);
+            .or_default();
         *sample_entry.entry(entry.tag).or_insert(0) += 1;
 
-        let stats = sample_stats.entry(entry.sample_source.clone()).or_insert(SampleStats {
-            source: entry.sample_source.clone(),
-            num_records: 0,
-            total_kmers: 0,
-            kmer_length_distribution: Vec::new(),
-        });
+        let stats = sample_stats
+            .entry(entry.sample_source.clone())
+            .or_insert(SampleStats {
+                source: entry.sample_source.clone(),
+                num_records: 0,
+                total_kmers: 0,
+                kmer_length_distribution: Vec::new(),
+            });
         stats.num_records += 1;
         stats.total_kmers += 1;
     }
 
     for stats in sample_stats.values_mut() {
-        let lengths: Vec<usize> = entries.iter()
+        let lengths: Vec<usize> = entries
+            .iter()
             .filter(|e| e.sample_source == stats.source)
             .map(|e| e.tag_length as usize)
             .collect();
@@ -347,7 +374,7 @@ fn view_sylsp(entries: Vec<crate::extract::SylspEntry>, file_path: &str) -> Resu
     let distribution = calculate_kmer_distribution(&tag_lengths);
     let unique_kmers = tag_frequency.len();
     let mut kmer_frequency_stats: Vec<(Hash, u32)> = tag_frequency.into_iter().collect();
-    kmer_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1));
+    kmer_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
 
     Ok(ViewResult {
         file_type: "SampleProfile".to_string(),
@@ -372,8 +399,11 @@ fn view_sylsp(entries: Vec<crate::extract::SylspEntry>, file_path: &str) -> Resu
 }
 
 fn view_db(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
-    println!("Attempting to deserialize {} as genome sketches...", file_path);
-    
+    println!(
+        "Attempting to deserialize {} as genome sketches...",
+        file_path
+    );
+
     let entries: Vec<GenomeSketch> = bincode::deserialize_from(reader)
         .with_context(|| format!("Failed to deserialize .db file: {}", file_path))?;
 
@@ -381,7 +411,11 @@ fn view_db(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
         return Err(anyhow::anyhow!("Empty .db file"));
     }
 
-    println!("Successfully deserialized {} genome sketches from {}", entries.len(), file_path);
+    println!(
+        "Successfully deserialized {} genome sketches from {}",
+        entries.len(),
+        file_path
+    );
 
     let mut kmer_lengths = Vec::new();
     let mut genome_sources = std::collections::HashSet::new();
@@ -398,10 +432,10 @@ fn view_db(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
         if i % 100 == 0 {
             println!("Processing genome sketch {}/{}", i + 1, entries.len());
         }
-        
+
         let source = &entry.file_name;
         genome_sources.insert(source.clone());
-        
+
         for kmer in &entry.genome_kmers {
             kmer_lengths.push(k); // K-mer size is always k
             *kmer_frequency.entry(*kmer).or_insert(0) += 1;
@@ -413,7 +447,7 @@ fn view_db(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
             total_kmers: 0,
             kmer_length_distribution: Vec::new(),
         });
-        
+
         stats.total_kmers += entry.genome_kmers.len();
     }
 
@@ -434,7 +468,7 @@ fn view_db(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
     // 计算k-mer统计信息
     let unique_kmers = kmer_frequency.len();
     let mut kmer_frequency_stats: Vec<(Hash, u32)> = kmer_frequency.into_iter().collect();
-    kmer_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1)); // 按频率降序排序
+    kmer_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count)); // 按频率降序排序
 
     Ok(ViewResult {
         file_type: "GenomeSketch".to_string(),
@@ -465,32 +499,42 @@ fn view_db(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
 fn view_sp(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
     // 尝试反序列化为单个SequencesSketch
     let single_sketch: Result<SequencesSketch, _> = bincode::deserialize_from(reader);
-    
+
     if let Ok(sketch) = single_sketch {
         // 单个样本文件
         return view_single_sp(sketch, file_path);
     }
-    
+
     // 如果单个反序列化失败，尝试作为多个sketch的列表
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
-    
+
     // 添加错误处理和日志
-    println!("Attempting to deserialize {} as multiple sketches...", file_path);
-    
+    println!(
+        "Attempting to deserialize {} as multiple sketches...",
+        file_path
+    );
+
     let sketches: Result<Vec<SequencesSketch>, _> = bincode::deserialize_from(reader);
-    
+
     if let Ok(sketches) = sketches {
         if sketches.is_empty() {
             return Err(anyhow::anyhow!("Empty .sp file"));
         }
 
-        println!("Successfully deserialized {} sketches from {}", sketches.len(), file_path);
+        println!(
+            "Successfully deserialized {} sketches from {}",
+            sketches.len(),
+            file_path
+        );
 
         let mut kmer_lengths = Vec::new();
         let mut sample_stats = std::collections::HashMap::new();
         let mut kmer_frequency = std::collections::HashMap::new();
-        let mut per_sample_kmer_counts: std::collections::HashMap<String, std::collections::HashMap<Hash, u32>> = std::collections::HashMap::new();
+        let mut per_sample_kmer_counts: std::collections::HashMap<
+            String,
+            std::collections::HashMap<Hash, u32>,
+        > = std::collections::HashMap::new();
 
         // 获取第一个条目的参数作为参考
         let first_sketch = &sketches[0];
@@ -501,9 +545,9 @@ fn view_sp(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
             if i % 100 == 0 {
                 println!("Processing sketch {}/{}", i + 1, sketches.len());
             }
-            
+
             let sample_name = sketch.sample_name.as_ref().unwrap_or(&sketch.file_name);
-            
+
             for (kmer, count) in &sketch.kmer_counts {
                 for _ in 0..*count {
                     kmer_lengths.push(k); // K-mer size is always k
@@ -513,16 +557,18 @@ fn view_sp(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
                 // 累积每个样本的 k-mer 计数
                 let sample_entry = per_sample_kmer_counts
                     .entry(sample_name.clone())
-                    .or_insert_with(std::collections::HashMap::new);
+                    .or_default();
                 *sample_entry.entry(*kmer).or_insert(0) += count;
             }
 
-            let stats = sample_stats.entry(sample_name.clone()).or_insert(SampleStats {
-                source: sample_name.clone(),
-                num_records: 1, // Each sketch represents one sample
-                total_kmers: 0,
-                kmer_length_distribution: Vec::new(),
-            });
+            let stats = sample_stats
+                .entry(sample_name.clone())
+                .or_insert(SampleStats {
+                    source: sample_name.clone(),
+                    num_records: 1, // Each sketch represents one sample
+                    total_kmers: 0,
+                    kmer_length_distribution: Vec::new(),
+                });
             stats.total_kmers += sketch.kmer_counts.values().sum::<u32>() as usize;
         }
 
@@ -531,7 +577,7 @@ fn view_sp(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
             for sketch in &sketches {
                 let sample_name = sketch.sample_name.as_ref().unwrap_or(&sketch.file_name);
                 if sample_name == &stats.source {
-                    for (_, count) in &sketch.kmer_counts {
+                    for count in sketch.kmer_counts.values() {
                         for _ in 0..*count {
                             sample_lengths.push(k); // K-mer size is always k
                         }
@@ -546,12 +592,11 @@ fn view_sp(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
         // 计算k-mer统计信息
         let unique_kmers = kmer_frequency.len();
         let mut kmer_frequency_stats: Vec<(Hash, u32)> = kmer_frequency.into_iter().collect();
-        kmer_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1)); // 按频率降序排序
+        kmer_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count)); // 按频率降序排序
 
         // 计算平均read长度
-        let total_mean_length: f64 = sketches.iter()
-            .map(|s| s.mean_read_length)
-            .sum::<f64>() / sketches.len() as f64;
+        let total_mean_length: f64 =
+            sketches.iter().map(|s| s.mean_read_length).sum::<f64>() / sketches.len() as f64;
 
         return Ok(ViewResult {
             file_type: "SampleSketch".to_string(),
@@ -574,19 +619,24 @@ fn view_sp(reader: BufReader<File>, file_path: &str) -> Result<ViewResult> {
             enzyme: None,
         });
     }
-    
-    // 如果Meta2bseek格式失败，尝试sylph格式
-    println!("Meta2bseek format failed, attempting sylph format...");
-    return Err(anyhow::anyhow!("File format not recognized. This file may be in sylph format or corrupted."));
+
+    // If Meta2bMap format parsing fails, attempt sylph format.
+    println!("Meta2bMap format failed, attempting sylph format...");
+    Err(anyhow::anyhow!(
+        "File format not recognized. This file may be in sylph format or corrupted."
+    ))
 }
 
 fn view_single_sp(sketch: SequencesSketch, file_path: &str) -> Result<ViewResult> {
     let mut kmer_lengths = Vec::new();
     let mut kmer_frequency = std::collections::HashMap::new();
-    let mut per_sample_kmer_counts: std::collections::HashMap<String, std::collections::HashMap<Hash, u32>> = std::collections::HashMap::new();
+    let mut per_sample_kmer_counts: std::collections::HashMap<
+        String,
+        std::collections::HashMap<Hash, u32>,
+    > = std::collections::HashMap::new();
 
     let sample_name = sketch.sample_name.as_ref().unwrap_or(&sketch.file_name);
-    
+
     for (kmer, count) in &sketch.kmer_counts {
         for _ in 0..*count {
             kmer_lengths.push(sketch.k); // K-mer size is always k
@@ -596,7 +646,7 @@ fn view_single_sp(sketch: SequencesSketch, file_path: &str) -> Result<ViewResult
         // 累积样本的 k-mer 计数
         let sample_entry = per_sample_kmer_counts
             .entry(sample_name.clone())
-            .or_insert_with(std::collections::HashMap::new);
+            .or_default();
         *sample_entry.entry(*kmer).or_insert(0) += count;
     }
 
@@ -605,7 +655,7 @@ fn view_single_sp(sketch: SequencesSketch, file_path: &str) -> Result<ViewResult
     // 计算k-mer统计信息
     let unique_kmers = kmer_frequency.len();
     let mut kmer_frequency_stats: Vec<(Hash, u32)> = kmer_frequency.into_iter().collect();
-    kmer_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1)); // 按频率降序排序
+    kmer_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count)); // 按频率降序排序
 
     let sample_stats = vec![SampleStats {
         source: sample_name.clone(),
@@ -638,7 +688,7 @@ fn view_single_sp(sketch: SequencesSketch, file_path: &str) -> Result<ViewResult
 
 fn calculate_kmer_distribution(kmer_lengths: &[usize]) -> Vec<(usize, usize, f64)> {
     use std::collections::HashMap;
-    
+
     let mut length_counts: HashMap<usize, usize> = HashMap::new();
     for &length in kmer_lengths {
         *length_counts.entry(length).or_insert(0) += 1;
@@ -683,11 +733,11 @@ fn collect_kmer_matrix_data(result: &ViewResult, kmer_matrix: &mut KmerMatrix) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            
+
             if !kmer_matrix.samples.contains(&sample_name) {
                 kmer_matrix.samples.push(sample_name.clone());
             }
-            
+
             // 收集该数据库中的所有k-mer
             for (kmer_hash, count) in &result.kmer_frequency_stats {
                 if !kmer_matrix.kmers.contains(kmer_hash) {
@@ -695,7 +745,7 @@ fn collect_kmer_matrix_data(result: &ViewResult, kmer_matrix: &mut KmerMatrix) {
                 }
                 let key = (sample_name.clone(), *kmer_hash);
                 let entry = kmer_matrix.matrix.entry(key).or_insert(0);
-                *entry += *count as u32;
+                *entry += *count;
             }
         }
         _ => {}
@@ -705,34 +755,37 @@ fn collect_kmer_matrix_data(result: &ViewResult, kmer_matrix: &mut KmerMatrix) {
 fn generate_tsv_matrix(kmer_matrix: &KmerMatrix, log_path: &str, tsv_name: &str) -> Result<()> {
     // 确保输出目录存在
     std::fs::create_dir_all(log_path)?;
-    
+
     // 构建完整的文件路径
     let tsv_path = Path::new(log_path).join(tsv_name);
     let mut tsv_writer = BufWriter::new(File::create(&tsv_path)?);
-    
+
     // 排序样本和k-mer以确保输出的一致性
     let mut sorted_samples = kmer_matrix.samples.clone();
     sorted_samples.sort();
     let mut sorted_kmers = kmer_matrix.kmers.clone();
     sorted_kmers.sort();
-    
+
     // 写入表头
     write!(tsv_writer, "K-mer")?; // 目前保存的是哈希，无法还原原始序列，这里用16进制hash展示
     for sample in &sorted_samples {
         write!(tsv_writer, "\t{}", sample)?;
     }
     writeln!(tsv_writer)?;
-    
+
     // 写入数据行
     for kmer in &sorted_kmers {
         write!(tsv_writer, "{:016x}", kmer)?;
         for sample in &sorted_samples {
-            let count = kmer_matrix.matrix.get(&(sample.clone(), *kmer)).unwrap_or(&0);
+            let count = kmer_matrix
+                .matrix
+                .get(&(sample.clone(), *kmer))
+                .unwrap_or(&0);
             write!(tsv_writer, "\t{}", count)?;
         }
         writeln!(tsv_writer)?;
     }
-    
+
     println!("K-mer count matrix saved to: {}", tsv_path.display());
     Ok(())
 }

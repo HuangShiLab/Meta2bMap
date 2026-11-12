@@ -1,8 +1,10 @@
-# meta2bmap
+# Meta2bMap
+
+![CI](https://github.com/HuangShiLab/Meta2bMap/actions/workflows/ci.yml/badge.svg)
 
 **Ultrafast coverage-adjusted ANI queries and taxonomic profiling for 2bRAD and shotgun metagenomic data.**
 
-meta2bmap is a Rust command-line tool that profiles metagenomic samples by matching
+Meta2bMap is a Rust command-line tool that profiles metagenomic samples by matching
 restriction-enzyme (2bRAD) tags extracted from sequencing reads against tags extracted
 from reference genomes. It reports per-genome containment ANI with a coverage-adjustment
 model (a negative-binomial per-locus model that corrects the naive containment ANI at low
@@ -11,11 +13,11 @@ coverage), together with taxonomic and sequence abundances.
 It works on two kinds of data:
 
 - **2bRAD / type-IIB restriction-enzyme data** — reads are (or contain) enzyme tags;
-  meta2bmap extracts the tags directly.
+  Meta2bMap extracts the tags directly.
 - **Shotgun data** — the same enzyme-tag scheme is applied in silico to shotgun reads,
   yielding a sparse but fast marker set.
 
-meta2bmap is part of the 2bRAD software family (with Fast2bRAD-M and Strain2bScan) and is
+Meta2bMap is part of the 2bRAD software family (with Fast2bRAD-M and Strain2bScan) and is
 a derivative of [sylph](https://github.com/bluenote-1577/sylph) (see
 [Relationship to sylph](#relationship-to-sylph) below).
 
@@ -23,7 +25,7 @@ Repository: <https://github.com/HuangShiLab/Meta2bMap>
 
 ## Installation
 
-meta2bmap is built from source with the Rust toolchain (Rust 1.70+).
+Meta2bMap is built from source with the Rust toolchain (Rust 1.85+).
 
 ### Supported platforms
 
@@ -229,14 +231,14 @@ produced by older builds.**
 
 ## Relationship to sylph
 
-meta2bmap is a derivative work of [sylph](https://github.com/bluenote-1577/sylph) by
+Meta2bMap is a derivative work of [sylph](https://github.com/bluenote-1577/sylph) by
 Jim Shaw, reusing its containment-ANI framework and parts of its code (e.g. the AVX2
 k-mer hashing), with modifications by the HuangShi Lab for restriction-enzyme tag
 extraction, multi-enzyme joint ANI, and the coverage-adjustment model. sylph is
-distributed under the MIT license; meta2bmap preserves sylph's copyright notice and
-license terms in [LICENSE](LICENSE). If you use meta2bmap, please also credit sylph.
+distributed under the MIT license; Meta2bMap preserves sylph's copyright notice and
+license terms in [LICENSE](LICENSE). If you use Meta2bMap, please also credit sylph.
 
 ## Citation
 
-A manuscript describing meta2bmap is in preparation. Until then, please cite this
+A manuscript describing Meta2bMap is in preparation. Until then, please cite this
 repository and the sylph paper (Shaw & Yu, *Nature Biotechnology*, 2024).

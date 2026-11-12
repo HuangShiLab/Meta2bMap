@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use needletail::parse_fastx_file;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use needletail::parse_fastx_file;
 // bytes::Regex 直接在 &[u8] 上匹配，避免每条序列的 from_utf8_lossy 全量拷贝。
 // 所有酶切模式都是 ASCII 的 [ACGT] 字符类，字节匹配与字符匹配完全等价。
 use regex::bytes::Regex;
@@ -13,16 +13,16 @@ use std::{
 };
 
 use crate::cmdline::ExtractArgs;
-use serde::{Serialize, Deserialize};
+use crate::constants::{hash_bytes, Hash};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use crate::constants::{Hash, hash_bytes};
 // 添加fxhash导入
 use fxhash::{FxHashMap, FxHashSet};
 
 // 添加内存统计导入
-use memory_stats::memory_stats;
 use log::*;
+use memory_stats::memory_stats;
 
 // 类型别名，与sylph保持一致
 pub type TagHash = Vec<u8>;
@@ -59,15 +59,13 @@ fn calculate_optimal_buffer_size(file_size: u64, is_compressed: bool) -> usize {
         // 小文件：64KB
         64 * 1024
     };
-    
+
     if is_compressed {
         base_size * 2
     } else {
         base_size
     }
 }
-
-
 
 // 内存监控函数，参考sketch中的check_vram_and_block
 // 使用 physical_mem 而非 virtual_mem，避免 macOS 上虚拟地址空间过大导致死锁。
@@ -76,7 +74,7 @@ fn calculate_optimal_buffer_size(file_size: u64, is_compressed: bool) -> usize {
 // 也不能无声地无限挂起。
 pub fn check_vram_and_block(max_ram: usize, file: &str) {
     if let Some(usage) = memory_stats() {
-        let mut gb_usage_curr = usage.physical_mem as f64 / 1_000_000_000 as f64;
+        let mut gb_usage_curr = usage.physical_mem as f64 / 1_000_000_000_f64;
         if (max_ram as f64) < gb_usage_curr {
             eprintln!(
                 "WARNING: memory limit reached ({:.1} GB > {} GB). Blocking extract for {} until memory frees. If this persists, re-run with a higher --max-ram.",
@@ -88,7 +86,7 @@ pub fn check_vram_and_block(max_ram: usize, file: &str) {
             thread::sleep(Duration::from_secs(5));
             blocked_secs += 5;
             if let Some(usage) = memory_stats() {
-                gb_usage_curr = usage.physical_mem as f64 / 1_000_000_000 as f64;
+                gb_usage_curr = usage.physical_mem as f64 / 1_000_000_000_f64;
             } else {
                 break;
             }
@@ -122,21 +120,11 @@ pub fn default_max_ram_gb() -> usize {
 
 // 动态内存管理函数
 pub fn get_memory_usage() -> Option<f64> {
-    memory_stats().map(|usage| usage.physical_mem as f64 / 1_000_000_000 as f64)
+    memory_stats().map(|usage| usage.physical_mem as f64 / 1_000_000_000_f64)
 }
 
-
-
-
-
-
-
 // 内存安全的处理函数
-pub fn safe_process_with_memory_check<F, T>(
-    max_ram: usize,
-    file: &str,
-    process_fn: F,
-) -> Result<T>
+pub fn safe_process_with_memory_check<F, T>(max_ram: usize, file: &str, process_fn: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
@@ -146,10 +134,10 @@ where
             check_vram_and_block(max_ram, file);
         }
     }
-    
+
     // 执行处理函数
     let result = process_fn()?;
-    
+
     // 处理完成后再次检查内存
     if let Some(current_memory) = get_memory_usage() {
         if current_memory > max_ram as f64 * 0.8 {
@@ -157,72 +145,102 @@ where
             thread::sleep(Duration::from_millis(100));
         }
     }
-    
+
     Ok(result)
 }
 
 pub const ENZYME_DEFINITIONS: &[(&str, &[&str])] = &[
-    ("CspCI", &[
-        r"[ACGT]{11}CAA[ACGT]{5}GTGG[ACGT]{10}",
-        r"[ACGT]{10}CCAC[ACGT]{5}TTG[ACGT]{11}",
-    ]),
-    ("AloI", &[
-        r"[ACGT]{7}GAAC[ACGT]{6}TCC[ACGT]{7}",
-        r"[ACGT]{7}GGA[ACGT]{6}GTTC[ACGT]{7}",
-    ]),
-    ("BsaXI", &[
-        r"[ACGT]{9}AC[ACGT]{5}CTCC[ACGT]{7}",
-        r"[ACGT]{7}GGAG[ACGT]{5}GT[ACGT]{9}",
-    ]),
-    ("BaeI", &[
-        r"[ACGT]{10}AC[ACGT]{4}GTA[CT]C[ACGT]{7}",
-        r"[ACGT]{7}G[AG]TAC[ACGT]{4}GT[ACGT]{10}",
-    ]),
-    ("BcgI", &[
-        r"[ACGT]{10}CGA[ACGT]{6}TGC[ACGT]{10}",
-        r"[ACGT]{10}GCA[ACGT]{6}TCG[ACGT]{10}",
-    ]),
-    ("CjeI", &[
-        r"[ACGT]{8}CCA[ACGT]{6}GT[ACGT]{9}",
-        r"[ACGT]{9}AC[ACGT]{6}TGG[ACGT]{8}",
-    ]),
-    ("PpiI", &[
-        r"[ACGT]{7}GAAC[ACGT]{5}CTC[ACGT]{8}",
-        r"[ACGT]{8}GAG[ACGT]{5}GTTC[ACGT]{7}",
-    ]),
-    ("PsrI", &[
-        r"[ACGT]{7}GAAC[ACGT]{6}TAC[ACGT]{7}",
-        r"[ACGT]{7}GTA[ACGT]{6}GTTC[ACGT]{7}",
-    ]),
-    ("BplI", &[
-        r"[ACGT]{8}GAG[ACGT]{5}CTC[ACGT]{8}",
-    ]),
-    ("FalI", &[
-        r"[ACGT]{8}AAG[ACGT]{5}CTT[ACGT]{8}",
-    ]),
-    ("Bsp24I", &[
-        r"[ACGT]{8}GAC[ACGT]{6}TGG[ACGT]{7}",
-        r"[ACGT]{7}CCA[ACGT]{6}GTC[ACGT]{8}",
-    ]),
-    ("HaeIV", &[
-        r"[ACGT]{7}GA[CT][ACGT]{5}[AG]TC[ACGT]{9}",
-        r"[ACGT]{9}GA[CT][ACGT]{5}[AG]TC[ACGT]{7}",
-    ]),
-    ("CjePI", &[
-        r"[ACGT]{7}CCA[ACGT]{7}TC[ACGT]{8}",
-        r"[ACGT]{8}GA[ACGT]{7}TGG[ACGT]{7}",
-    ]),
-    ("Hin4I", &[
-        r"[ACGT]{8}GA[CT][ACGT]{5}[GAC]TC[ACGT]{8}",
-        r"[ACGT]{8}GA[CTG][ACGT]{5}[AG]TC[ACGT]{8}",
-    ]),
-    ("AlfI", &[
-        r"[ACGT]{10}GCA[ACGT]{6}TGC[ACGT]{10}",
-    ]),
-    ("BslFI", &[
-        r"[ACGT]{6}GGGAC[ACGT]{14}",
-        r"[ACGT]{14}GTCCC[ACGT]{6}",
-    ]),
+    (
+        "CspCI",
+        &[
+            r"[ACGT]{11}CAA[ACGT]{5}GTGG[ACGT]{10}",
+            r"[ACGT]{10}CCAC[ACGT]{5}TTG[ACGT]{11}",
+        ],
+    ),
+    (
+        "AloI",
+        &[
+            r"[ACGT]{7}GAAC[ACGT]{6}TCC[ACGT]{7}",
+            r"[ACGT]{7}GGA[ACGT]{6}GTTC[ACGT]{7}",
+        ],
+    ),
+    (
+        "BsaXI",
+        &[
+            r"[ACGT]{9}AC[ACGT]{5}CTCC[ACGT]{7}",
+            r"[ACGT]{7}GGAG[ACGT]{5}GT[ACGT]{9}",
+        ],
+    ),
+    (
+        "BaeI",
+        &[
+            r"[ACGT]{10}AC[ACGT]{4}GTA[CT]C[ACGT]{7}",
+            r"[ACGT]{7}G[AG]TAC[ACGT]{4}GT[ACGT]{10}",
+        ],
+    ),
+    (
+        "BcgI",
+        &[
+            r"[ACGT]{10}CGA[ACGT]{6}TGC[ACGT]{10}",
+            r"[ACGT]{10}GCA[ACGT]{6}TCG[ACGT]{10}",
+        ],
+    ),
+    (
+        "CjeI",
+        &[
+            r"[ACGT]{8}CCA[ACGT]{6}GT[ACGT]{9}",
+            r"[ACGT]{9}AC[ACGT]{6}TGG[ACGT]{8}",
+        ],
+    ),
+    (
+        "PpiI",
+        &[
+            r"[ACGT]{7}GAAC[ACGT]{5}CTC[ACGT]{8}",
+            r"[ACGT]{8}GAG[ACGT]{5}GTTC[ACGT]{7}",
+        ],
+    ),
+    (
+        "PsrI",
+        &[
+            r"[ACGT]{7}GAAC[ACGT]{6}TAC[ACGT]{7}",
+            r"[ACGT]{7}GTA[ACGT]{6}GTTC[ACGT]{7}",
+        ],
+    ),
+    ("BplI", &[r"[ACGT]{8}GAG[ACGT]{5}CTC[ACGT]{8}"]),
+    ("FalI", &[r"[ACGT]{8}AAG[ACGT]{5}CTT[ACGT]{8}"]),
+    (
+        "Bsp24I",
+        &[
+            r"[ACGT]{8}GAC[ACGT]{6}TGG[ACGT]{7}",
+            r"[ACGT]{7}CCA[ACGT]{6}GTC[ACGT]{8}",
+        ],
+    ),
+    (
+        "HaeIV",
+        &[
+            r"[ACGT]{7}GA[CT][ACGT]{5}[AG]TC[ACGT]{9}",
+            r"[ACGT]{9}GA[CT][ACGT]{5}[AG]TC[ACGT]{7}",
+        ],
+    ),
+    (
+        "CjePI",
+        &[
+            r"[ACGT]{7}CCA[ACGT]{7}TC[ACGT]{8}",
+            r"[ACGT]{8}GA[ACGT]{7}TGG[ACGT]{7}",
+        ],
+    ),
+    (
+        "Hin4I",
+        &[
+            r"[ACGT]{8}GA[CT][ACGT]{5}[GAC]TC[ACGT]{8}",
+            r"[ACGT]{8}GA[CTG][ACGT]{5}[AG]TC[ACGT]{8}",
+        ],
+    ),
+    ("AlfI", &[r"[ACGT]{10}GCA[ACGT]{6}TGC[ACGT]{10}"]),
+    (
+        "BslFI",
+        &[r"[ACGT]{6}GGGAC[ACGT]{14}", r"[ACGT]{14}GTCCC[ACGT]{6}"],
+    ),
 ];
 
 // 定义每个内切酶的标签长度（固定匹配碱基数 + 自由匹配碱基数）
@@ -305,9 +323,12 @@ const BASE_BIT: [u8; 256] = {
     table
 };
 
+type PatternMasks = Vec<u8>;
+type PatternRuns = Vec<(usize, Vec<u8>)>;
+
 /// 把酶切正则（仅由 ACGT 字面量、[...] 字符类和定长 {n} 重复组成）解析为
 /// 逐位置掩码 + 字面量段列表（偏移, 字节）。语法超出的 pattern 直接报错。
-fn parse_pattern_masks(pat: &str) -> Result<(Vec<u8>, Vec<(usize, Vec<u8>)>)> {
+fn parse_pattern_masks(pat: &str) -> Result<(PatternMasks, PatternRuns)> {
     let b = pat.as_bytes();
     let mut i = 0usize;
     let mut masks = Vec::new();
@@ -335,7 +356,9 @@ fn parse_pattern_masks(pat: &str) -> Result<(Vec<u8>, Vec<(usize, Vec<u8>)>)> {
                         .iter()
                         .position(|&c| c == b'}')
                         .map(|p| p + i)
-                        .ok_or_else(|| anyhow::anyhow!("Unclosed quantifier in pattern: {}", pat))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Unclosed quantifier in pattern: {}", pat)
+                        })?;
                     let n: usize = std::str::from_utf8(&b[i + 1..k])
                         .ok()
                         .and_then(|s| s.parse().ok())
@@ -377,7 +400,10 @@ impl EnzymeSpec {
         let names: Vec<&str> = if name.eq_ignore_ascii_case("all") {
             ENZYME_DEFINITIONS.iter().map(|(n, _)| *n).collect()
         } else {
-            name.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+            name.split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
         };
 
         if names.is_empty() {
@@ -405,7 +431,8 @@ impl EnzymeSpec {
                 .ok_or_else(|| anyhow::anyhow!("Missing tag length for enzyme: {}", def.0))?;
 
             for pat in def.1 {
-                all_patterns.push(Regex::new(pat).context(format!("Invalid regex pattern: {}", pat))?);
+                all_patterns
+                    .push(Regex::new(pat).context(format!("Invalid regex pattern: {}", pat))?);
                 all_pattern_strs.push(*pat);
                 all_lengths.push(tag_length);
             }
@@ -417,13 +444,11 @@ impl EnzymeSpec {
         // 曾尝试对 29 个 pattern 也用 alternation + 放大 DFA 缓存，仍会退化，比
         // 逐 pattern 基线慢几十倍。
         let scanner = if all_pattern_strs.len() <= REGEX_SCAN_MAX_PATTERNS {
-            let combined = regex::bytes::RegexBuilder::new(&format!(
-                "(?:{})",
-                all_pattern_strs.join("|")
-            ))
-            .dfa_size_limit(64 * (1 << 20))
-            .build()
-            .context("Invalid combined enzyme pattern")?;
+            let combined =
+                regex::bytes::RegexBuilder::new(&format!("(?:{})", all_pattern_strs.join("|")))
+                    .dfa_size_limit(64 * (1 << 20))
+                    .build()
+                    .context("Invalid combined enzyme pattern")?;
             let mut anchored = Vec::with_capacity(all_pattern_strs.len());
             for pat in &all_pattern_strs {
                 anchored.push(
@@ -628,7 +653,7 @@ pub fn one_mismatch_canonical_hashes(tag: &[u8]) -> Vec<Hash> {
     let mut buf = [0u8; MAX_TAG_LEN];
     let mut neighbor_buf = [0u8; MAX_TAG_LEN];
     for (i, &orig) in tag.iter().enumerate() {
-        for alt in [b'A', b'C', b'G', b'T'] {
+        for alt in *b"ACGT" {
             if alt == orig {
                 continue;
             }
@@ -987,72 +1012,81 @@ pub fn process_input(
     _threads: usize,
     format: &str,
 ) -> Result<()> {
-    let enzyme = EnzymeSpec::new(enzyme_name)
-        .context(format!("Unsupported enzyme: {}", enzyme_name))?;
+    let enzyme =
+        EnzymeSpec::new(enzyme_name).context(format!("Unsupported enzyme: {}", enzyme_name))?;
 
     for input_path in &input_files {
         // 确定输入文件类型
-        let is_fasta = is_fasta_file(input_path)
-            .context("Failed to determine if file is FASTA")?;
-        let is_fastq = is_fastq_file(input_path)
-            .context("Failed to determine if file is FASTQ")?;
+        let is_fasta = is_fasta_file(input_path).context("Failed to determine if file is FASTA")?;
+        let is_fastq = is_fastq_file(input_path).context("Failed to determine if file is FASTQ")?;
 
         if !is_fasta && !is_fastq {
-            return Err(anyhow::anyhow!("Unsupported file format: {}", input_path.display()));
+            return Err(anyhow::anyhow!(
+                "Unsupported file format: {}",
+                input_path.display()
+            ));
         }
 
-        let file_stem = input_path.file_stem()
+        let file_stem = input_path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
-            
+
         let output_name = if format == "fq" {
             format!("{}.fq", file_stem)
         } else {
             format!("{}.fa", file_stem)
         };
-        
+
         let mut output_path = PathBuf::from(sample_output_dir);
         output_path.push(output_name);
 
         // 根据文件类型处理
         if is_fasta {
-            process_fasta(input_path, &output_path, &enzyme, format, input_path.to_string_lossy().ends_with(".gz"))?;
+            process_fasta(
+                input_path,
+                &output_path,
+                &enzyme,
+                format,
+                input_path.to_string_lossy().ends_with(".gz"),
+            )?;
         } else {
-            process_fastq(input_path, &output_path, &enzyme, format, input_path.to_string_lossy().ends_with(".gz"))?;
+            process_fastq(
+                input_path,
+                &output_path,
+                &enzyme,
+                format,
+                input_path.to_string_lossy().ends_with(".gz"),
+            )?;
         }
     }
 
     Ok(())
 }
 
-
-
 #[allow(dead_code)]
 fn is_fasta_file(path: &Path) -> Result<bool> {
     // 检查文件扩展名
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     // 如果是压缩文件，获取原始扩展名
-    let base_name = path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    
+    let base_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
     let is_fasta_ext = if base_name.ends_with(".gz") {
         // 移除 .gz 后缀并检查原始扩展名
         let without_gz = base_name.trim_end_matches(".gz");
-        without_gz.ends_with(".fa") || 
-        without_gz.ends_with(".fasta") || 
-        without_gz.ends_with(".fna") || 
-        without_gz.ends_with(".ffn") || 
-        without_gz.ends_with(".faa") || 
-        without_gz.ends_with(".frn")
+        without_gz.ends_with(".fa")
+            || without_gz.ends_with(".fasta")
+            || without_gz.ends_with(".fna")
+            || without_gz.ends_with(".ffn")
+            || without_gz.ends_with(".faa")
+            || without_gz.ends_with(".frn")
     } else {
-        matches!(ext.as_str(), 
-            "fa" | "fasta" | "fna" | "ffn" | "faa" | "frn"
-        )
+        matches!(ext.as_str(), "fa" | "fasta" | "fna" | "ffn" | "faa" | "frn")
     };
 
     // 如果扩展名不明确，检查文件内容
@@ -1070,18 +1104,14 @@ fn is_fasta_file(path: &Path) -> Result<bool> {
 #[allow(dead_code)]
 fn is_fastq_file(path: &Path) -> Result<bool> {
     // 检查文件扩展名
-    let base_name = path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    
+    let base_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
     let is_fastq_ext = if base_name.ends_with(".gz") {
         // 移除 .gz 后缀并检查原始扩展名
         let without_gz = base_name.trim_end_matches(".gz");
-        without_gz.ends_with(".fq") || 
-        without_gz.ends_with(".fastq")
+        without_gz.ends_with(".fq") || without_gz.ends_with(".fastq")
     } else {
-        base_name.ends_with(".fq") || 
-        base_name.ends_with(".fastq")
+        base_name.ends_with(".fq") || base_name.ends_with(".fastq")
     };
 
     // 如果扩展名不明确，检查文件内容
@@ -1106,14 +1136,17 @@ fn process_fasta_sylph_style(
 ) -> Result<()> {
     let mut writer = create_writer(output, compress)?;
     let mut stats = ExtractionStats::new();
-    
+
     // 完全按照sylph的模式
     let reader = parse_fastx_file(input);
     if !reader.is_ok() {
-        warn!("{} is not a valid fasta/fastq file; skipping.", input.display());
+        warn!(
+            "{} is not a valid fasta/fastq file; skipping.",
+            input.display()
+        );
         return Ok(());
     }
-    
+
     let mut reader = reader.unwrap();
     let mut kmer_to_tag_table = FxHashSet::default();
     // 每条记录复用的缓冲区，避免 per-record 分配
@@ -1122,7 +1155,8 @@ fn process_fasta_sylph_style(
 
     while let Some(record) = reader.next() {
         if record.is_ok() {
-            let record = record.expect(&format!("Invalid record for file {} ", input.display()));
+            let record =
+                record.unwrap_or_else(|_| panic!("Invalid record for file {} ", input.display()));
             let seq = record.seq();
             let seq_id = String::from_utf8_lossy(record.id());
 
@@ -1148,8 +1182,6 @@ fn process_fasta_sylph_style(
     Ok(())
 }
 
-
-
 fn process_fasta(
     input: &Path,
     output: &Path,
@@ -1171,14 +1203,17 @@ fn process_fastq_sylph_style(
 ) -> Result<()> {
     let mut writer = create_writer(output, compress)?;
     let mut stats = ExtractionStats::new();
-    
+
     // 完全按照sylph的模式
     let reader = parse_fastx_file(input);
     if !reader.is_ok() {
-        warn!("{} is not a valid fasta/fastq file; skipping.", input.display());
+        warn!(
+            "{} is not a valid fasta/fastq file; skipping.",
+            input.display()
+        );
         return Ok(());
     }
-    
+
     let mut reader = reader.unwrap();
     let mut kmer_to_tag_table = FxHashSet::default();
     // 每条记录复用的缓冲区，避免 per-record 分配
@@ -1187,7 +1222,8 @@ fn process_fastq_sylph_style(
 
     while let Some(record) = reader.next() {
         if record.is_ok() {
-            let record = record.expect(&format!("Invalid record for file {} ", input.display()));
+            let record =
+                record.unwrap_or_else(|_| panic!("Invalid record for file {} ", input.display()));
             let seq = record.seq();
             let seq_id = String::from_utf8_lossy(record.id());
 
@@ -1224,23 +1260,19 @@ fn process_fastq(
     process_fastq_sylph_style(input, output, enzyme, format, compress)
 }
 
-fn write_tags(
-    writer: &mut dyn Write,
-    seq_id: &str,
-    tags: &[TagHash],
-    format: &str,
-) -> Result<()> {
+fn write_tags(writer: &mut dyn Write, seq_id: &str, tags: &[TagHash], format: &str) -> Result<()> {
     for (i, tag) in tags.iter().enumerate() {
         let header = format!("{}_tag{}", seq_id, i + 1);
         match format {
-            "fq" => writeln!(writer, "@{}\n{}\n+\n{}", 
-                           header, 
-                           String::from_utf8_lossy(tag),
-                           "~".repeat(tag.len()))
-                .context("Failed to write FASTQ record")?,
-            _ => writeln!(writer, ">{}\n{}", 
-                        header, 
-                        String::from_utf8_lossy(tag))
+            "fq" => writeln!(
+                writer,
+                "@{}\n{}\n+\n{}",
+                header,
+                String::from_utf8_lossy(tag),
+                "~".repeat(tag.len())
+            )
+            .context("Failed to write FASTQ record")?,
+            _ => writeln!(writer, ">{}\n{}", header, String::from_utf8_lossy(tag))
                 .context("Failed to write FASTA record")?,
         }
     }
@@ -1248,13 +1280,13 @@ fn write_tags(
 }
 
 fn create_reader(path: &Path) -> Result<Box<dyn BufRead>> {
-    let file = File::open(path)
-        .context(format!("Failed to open input file: {}", path.display()))?;
+    let file =
+        File::open(path).context(format!("Failed to open input file: {}", path.display()))?;
 
     // 使用优化的文件大小检测
     let file_size = get_file_size_optimized(path)?;
     let is_compressed = path.to_string_lossy().ends_with(".gz");
-    
+
     // 使用优化的缓冲区大小计算
     let buffer_size = calculate_optimal_buffer_size(file_size, is_compressed);
 
@@ -1266,19 +1298,18 @@ fn create_reader(path: &Path) -> Result<Box<dyn BufRead>> {
 }
 
 fn create_writer(path: &Path, compress: bool) -> Result<Box<dyn Write>> {
-    let file = File::create(path)
-        .context(format!("Failed to create output file: {}", path.display()))?;
+    let file =
+        File::create(path).context(format!("Failed to create output file: {}", path.display()))?;
 
     // 使用优化的缓冲区大小和压缩设置
-    let buffer_size = if compress {
-        256 * 1024
-    } else {
-        128 * 1024
-    };
+    let buffer_size = if compress { 256 * 1024 } else { 128 * 1024 };
 
     Ok(if compress {
         let compression = get_optimal_compression();
-        Box::new(BufWriter::with_capacity(buffer_size, GzEncoder::new(file, compression)))
+        Box::new(BufWriter::with_capacity(
+            buffer_size,
+            GzEncoder::new(file, compression),
+        ))
     } else {
         Box::new(BufWriter::with_capacity(buffer_size, file))
     })
@@ -1290,8 +1321,6 @@ pub struct ExtractionStats {
     total_tags: usize,
     total_sequence_length: usize,
 }
-
-
 
 impl ExtractionStats {
     fn new() -> Self {
@@ -1305,18 +1334,17 @@ impl ExtractionStats {
 
 fn log_stats(stats: ExtractionStats, enzyme: &EnzymeSpec) {
     let k = enzyme.patterns[0].as_str().len();
-    let total_kmers = if stats.total_sequence_length >= (k - 1) * stats.total_sequences {
-        stats.total_sequence_length - (k - 1) * stats.total_sequences
-    } else {
-        0
-    };
+    let total_kmers = stats
+        .total_sequence_length
+        .saturating_sub((k - 1) * stats.total_sequences);
     let percentage = calculate_tag_percentage(stats.total_tags, total_kmers);
 
     // 酶的标签长度在 EnzymeSpec 构造时已查好，直接复用
     let tag_length = enzyme.tag_length;
 
-    let tag_bases_percentage = (stats.total_tags * tag_length) as f64 / stats.total_sequence_length as f64 * 100.0;
-    
+    let tag_bases_percentage =
+        (stats.total_tags * tag_length) as f64 / stats.total_sequence_length as f64 * 100.0;
+
     println!(
         "\nProcessing complete for {}:\n\
         =============================\n\
@@ -1338,7 +1366,8 @@ fn log_stats(stats: ExtractionStats, enzyme: &EnzymeSpec) {
         total_kmers,
         percentage,
         tag_bases_percentage,
-        enzyme.patterns
+        enzyme
+            .patterns
             .iter()
             .map(|r| r.as_str())
             .collect::<Vec<_>>()
@@ -1365,12 +1394,7 @@ fn process_paired_fastq_files(
         .to_string();
 
     // 处理一对文件
-    let fa_entries = process_paired_fastq_to_sylsp(
-        first_file,
-        second_file,
-        enzyme,
-        &file_stem,
-    )?;
+    let fa_entries = process_paired_fastq_to_sylsp(first_file, second_file, enzyme, &file_stem)?;
 
     // 注释掉生成单个文件的代码 - 只保留合并后的文件
     // let output_base = Path::new(sample_output_dir).join(&file_stem);
@@ -1406,6 +1430,10 @@ fn process_paired_fastq_files(
 }
 
 pub fn extract(args: ExtractArgs) -> Result<()> {
+    if args.threads == 0 {
+        return Err(anyhow::anyhow!("--threads must be greater than 0"));
+    }
+
     // 初始化线程池
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
@@ -1422,7 +1450,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
         return Err(anyhow::anyhow!("Max ram must be >= 7. Exiting."));
     }
     if args.max_ram.is_none() {
-        eprintln!("Memory limit: {} GB (default 75% of total RAM; override with --max-ram)", max_ram);
+        eprintln!(
+            "Memory limit: {} GB (default 75% of total RAM; override with --max-ram)",
+            max_ram
+        );
     }
 
     // 处理单对双端测序文件（-1 和 -2 参数）
@@ -1442,22 +1473,27 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
     }
 
     // 处理批处理双端测序文件（--l1 和 --l2 参数）
-    if let (Some(first_pair_list), Some(second_pair_list)) = (&args.first_pair_list, &args.second_pair_list) {
+    if let (Some(first_pair_list), Some(second_pair_list)) =
+        (&args.first_pair_list, &args.second_pair_list)
+    {
         // 读取文件列表
-        let first_pairs = read_file_list(first_pair_list)
-            .context("Failed to read first pair list")?;
-        let second_pairs = read_file_list(second_pair_list)
-            .context("Failed to read second pair list")?;
+        let first_pairs =
+            read_file_list(first_pair_list).context("Failed to read first pair list")?;
+        let second_pairs =
+            read_file_list(second_pair_list).context("Failed to read second pair list")?;
 
         if first_pairs.len() != second_pairs.len() {
-            return Err(anyhow::anyhow!("Number of files in first pair list and second pair list do not match"));
+            return Err(anyhow::anyhow!(
+                "Number of files in first pair list and second pair list do not match"
+            ));
         }
 
         let enzyme = EnzymeSpec::new(&args.enzyme)?;
         let mut all_sylsp_entries = Vec::new();
 
         // 并行处理所有配对文件，添加内存监控
-        let results: Vec<Result<(String, Vec<SylspEntry>)>> = first_pairs.par_iter()
+        let results: Vec<Result<(String, Vec<SylspEntry>)>> = first_pairs
+            .par_iter()
             .zip(second_pairs.par_iter())
             .map(|(first_file, second_file)| {
                 // 检查内存使用
@@ -1466,9 +1502,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         check_vram_and_block(max_ram, first_file);
                     }
                 }
-                
+
                 let input_path1 = PathBuf::from(first_file);
-                let file_stem = input_path1.file_stem()
+                let file_stem = input_path1
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .split('.')
@@ -1477,12 +1514,8 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                     .to_string();
 
                 // 处理一对文件
-                let fa_entries = process_paired_fastq_to_sylsp(
-                    first_file,
-                    second_file,
-                    &enzyme,
-                    &file_stem,
-                )?;
+                let fa_entries =
+                    process_paired_fastq_to_sylsp(first_file, second_file, &enzyme, &file_stem)?;
 
                 // 注释掉生成单个文件的代码 - 只保留合并后的文件
                 // let output_base = Path::new(&args.sample_output_dir).join(&file_stem);
@@ -1518,19 +1551,25 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
             match result {
                 Ok((_, entries)) => {
                     all_sylsp_entries.extend(entries);
-                },
+                }
                 Err(e) => eprintln!("Error processing paired files: {}", e),
             }
         }
 
         // 生成合并的 sylsp 文件
         if !all_sylsp_entries.is_empty() {
-            let output_name = args.out_name.as_ref().map_or_else(|| "combined".to_string(), |s| s.clone());
-            let combined_sylsp_path = Path::new(&args.sample_output_dir).join(format!("{}.sylsp", output_name));
-            let combined_sylsp_file = File::create(&combined_sylsp_path)
-                .context(format!("Failed to create combined sylsp file: {}", combined_sylsp_path.display()))?;
+            let output_name = args
+                .out_name
+                .as_ref()
+                .map_or_else(|| "combined".to_string(), |s| s.clone());
+            let combined_sylsp_path =
+                Path::new(&args.sample_output_dir).join(format!("{}.sylsp", output_name));
+            let combined_sylsp_file = File::create(&combined_sylsp_path).context(format!(
+                "Failed to create combined sylsp file: {}",
+                combined_sylsp_path.display()
+            ))?;
             let combined_sylsp_writer = BufWriter::new(combined_sylsp_file);
-            
+
             bincode::serialize_into(combined_sylsp_writer, &all_sylsp_entries)
                 .context("Failed to serialize combined sylsp data")?;
         }
@@ -1543,7 +1582,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
         let enzyme = EnzymeSpec::new(&args.enzyme)?;
 
         // FASTA 流式写出：边处理边写，避免把所有 tag 字节缓存在内存里。
-        let output_name = args.out_name.as_ref().map_or_else(|| "reads".to_string(), |s| s.clone());
+        let output_name = args
+            .out_name
+            .as_ref()
+            .map_or_else(|| "reads".to_string(), |s| s.clone());
         let fa_path = Path::new(&args.sample_output_dir).join(format!("{}.fasta", output_name));
         let mut fa_writer = create_writer(&fa_path, false)?;
 
@@ -1556,7 +1598,8 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
             }
 
             let input_path = PathBuf::from(&file);
-            let file_stem = input_path.file_stem()
+            let file_stem = input_path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .split('.')
@@ -1571,8 +1614,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                 log_stats(stats, &enzyme);
                 continue;
             }
-            let mut reader = parse_fastx_file(&input_path)
-                .context(format!("Failed to open reads file: {}", input_path.display()))?;
+            let mut reader = parse_fastx_file(&input_path).context(format!(
+                "Failed to open reads file: {}",
+                input_path.display()
+            ))?;
 
             // 单文件内按 chunk 并行提取：串行解析（gzip 解压本身无法并行），
             // 把一个 chunk 的 (id, seq) 拷出后由 rayon 并行做酶切扫描，
@@ -1611,7 +1656,8 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         let mut entries = Vec::with_capacity(tags.len());
                         for (i, (h, tag, tag_len)) in tags.into_iter().enumerate() {
                             let entry_id = format!("{}_tag{}", id_lossy, i + 1);
-                            let _ = writeln!(frag, ">{}\n{}", entry_id, String::from_utf8_lossy(&tag));
+                            let _ =
+                                writeln!(frag, ">{}\n{}", entry_id, String::from_utf8_lossy(&tag));
                             entries.push(SylspEntry {
                                 sequence_id: entry_id,
                                 tag: h,
@@ -1626,7 +1672,9 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
 
                 for (frag, entries) in chunk_results {
                     stats.total_tags += entries.len();
-                    fa_writer.write_all(&frag).context("Failed to write FASTA record")?;
+                    fa_writer
+                        .write_all(&frag)
+                        .context("Failed to write FASTA record")?;
                     all_sylsp_entries.extend(entries);
                 }
             }
@@ -1636,8 +1684,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
 
         // 生成 .sylsp 文件
         let sylsp_path = Path::new(&args.sample_output_dir).join(format!("{}.sylsp", output_name));
-        let sylsp_file = File::create(&sylsp_path)
-            .context(format!("Failed to create sylsp file: {}", sylsp_path.display()))?;
+        let sylsp_file = File::create(&sylsp_path).context(format!(
+            "Failed to create sylsp file: {}",
+            sylsp_path.display()
+        ))?;
         let sylsp_writer = BufWriter::new(sylsp_file);
 
         bincode::serialize_into(sylsp_writer, &all_sylsp_entries)
@@ -1649,15 +1699,17 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
         let file = File::open(genome_list)
             .context(format!("Failed to open genome list file: {}", genome_list))?;
         let reader = BufReader::new(file);
-        let genome_files: Vec<String> = reader.lines()
-            .filter_map(|line| line.ok())
-            .collect();
+        let genome_files: Vec<String> = reader
+            .lines()
+            .collect::<std::io::Result<_>>()
+            .with_context(|| format!("Failed to read genome list file: {}", genome_list))?;
 
         let enzyme = EnzymeSpec::new(&args.enzyme)?;
         let mut all_syldb_entries = Vec::new();
-        
+
         // 并行处理所有 FASTA 文件，添加内存监控
-        let results: Vec<Result<Vec<SyldbEntry>>> = genome_files.par_iter()
+        let results: Vec<Result<Vec<SyldbEntry>>> = genome_files
+            .par_iter()
             .map(|file| {
                 // 检查内存使用
                 if let Some(current_memory) = get_memory_usage() {
@@ -1665,9 +1717,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         check_vram_and_block(max_ram, file);
                     }
                 }
-                
+
                 let input_path = Path::new(file);
-                let output_base = Path::new(&args.sample_output_dir).join(input_path.file_stem().unwrap_or_default());
+                let output_base = Path::new(&args.sample_output_dir)
+                    .join(input_path.file_stem().unwrap_or_default());
                 process_fasta_to_syldb(
                     input_path,
                     &output_base,
@@ -1688,7 +1741,7 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         entry.genome_source = file.clone();
                     }
                     all_syldb_entries.extend(entries);
-                },
+                }
                 Err(e) => {
                     eprintln!("Error processing FASTA file: {}", e);
                 }
@@ -1697,12 +1750,18 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
 
         // 生成合并的 .syldb 文件
         if !all_syldb_entries.is_empty() {
-            let output_name = args.out_name.as_ref().map_or_else(|| "combined".to_string(), |s| s.clone());
-            let combined_syldb_path = Path::new(&args.sample_output_dir).join(format!("{}.syldb", output_name));
-            let combined_syldb_file = File::create(&combined_syldb_path)
-                .context(format!("Failed to create combined syldb file: {}", combined_syldb_path.display()))?;
+            let output_name = args
+                .out_name
+                .as_ref()
+                .map_or_else(|| "combined".to_string(), |s| s.clone());
+            let combined_syldb_path =
+                Path::new(&args.sample_output_dir).join(format!("{}.syldb", output_name));
+            let combined_syldb_file = File::create(&combined_syldb_path).context(format!(
+                "Failed to create combined syldb file: {}",
+                combined_syldb_path.display()
+            ))?;
             let combined_syldb_writer = BufWriter::new(combined_syldb_file);
-            
+
             write_syldb(combined_syldb_writer, &all_syldb_entries)
                 .context("Failed to serialize combined syldb data")?;
         }
@@ -1712,9 +1771,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
     if let Some(genome_files) = &args.genomes {
         let enzyme = EnzymeSpec::new(&args.enzyme)?;
         let mut all_syldb_entries = Vec::new();
-        
+
         // 并行处理所有 FASTA 文件，添加内存监控
-        let results: Vec<Result<Vec<SyldbEntry>>> = genome_files.par_iter()
+        let results: Vec<Result<Vec<SyldbEntry>>> = genome_files
+            .par_iter()
             .map(|file| {
                 // 检查内存使用
                 if let Some(current_memory) = get_memory_usage() {
@@ -1722,9 +1782,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         check_vram_and_block(max_ram, file);
                     }
                 }
-                
+
                 let input_path = Path::new(file);
-                let output_base = Path::new(&args.sample_output_dir).join(input_path.file_stem().unwrap_or_default());
+                let output_base = Path::new(&args.sample_output_dir)
+                    .join(input_path.file_stem().unwrap_or_default());
                 process_fasta_to_syldb(
                     input_path,
                     &output_base,
@@ -1745,7 +1806,7 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         entry.genome_source = file.clone();
                     }
                     all_syldb_entries.extend(entries);
-                },
+                }
                 Err(e) => {
                     eprintln!("Error processing FASTA file: {}", e);
                 }
@@ -1754,12 +1815,18 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
 
         // 生成合并的 .syldb 文件
         if !all_syldb_entries.is_empty() {
-            let output_name = args.out_name.as_ref().map_or_else(|| "combined".to_string(), |s| s.clone());
-            let combined_syldb_path = Path::new(&args.sample_output_dir).join(format!("{}.syldb", output_name));
-            let combined_syldb_file = File::create(&combined_syldb_path)
-                .context(format!("Failed to create combined syldb file: {}", combined_syldb_path.display()))?;
+            let output_name = args
+                .out_name
+                .as_ref()
+                .map_or_else(|| "combined".to_string(), |s| s.clone());
+            let combined_syldb_path =
+                Path::new(&args.sample_output_dir).join(format!("{}.syldb", output_name));
+            let combined_syldb_file = File::create(&combined_syldb_path).context(format!(
+                "Failed to create combined syldb file: {}",
+                combined_syldb_path.display()
+            ))?;
             let combined_syldb_writer = BufWriter::new(combined_syldb_file);
-            
+
             write_syldb(combined_syldb_writer, &all_syldb_entries)
                 .context("Failed to serialize combined syldb data")?;
         }
@@ -1769,21 +1836,23 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
     if let Some(sample_list) = &args.sample_list {
         let mut all_sylsp_entries = Vec::new();
         let enzyme = EnzymeSpec::new(&args.enzyme)?;
-        
+
         // 读取样本列表文件
         let file = File::open(sample_list)
             .context(format!("Failed to open sample list file: {}", sample_list))?;
         let reader = BufReader::new(file);
-        
+
         // 并行处理所有样本文件
-        let sample_files: Vec<String> = reader.lines()
-            .filter_map(|line| line.ok())
-            .collect();
-            
+        let sample_files: Vec<String> = reader
+            .lines()
+            .collect::<std::io::Result<_>>()
+            .with_context(|| format!("Failed to read sample list file: {}", sample_list))?;
+
         // 使用FxHashMap优化样本处理
         let sample_stats = Arc::new(Mutex::new(SampleStatsMap::default()));
-        
-        let results: Vec<Result<(String, Vec<SylspEntry>)>> = sample_files.par_iter()
+
+        let results: Vec<Result<(String, Vec<SylspEntry>)>> = sample_files
+            .par_iter()
             .map(|file| {
                 // 检查内存使用
                 if let Some(current_memory) = get_memory_usage() {
@@ -1791,10 +1860,11 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                         check_vram_and_block(max_ram, file);
                     }
                 }
-                
+
                 let input_path = PathBuf::from(file);
                 // 修正样本名提取逻辑
-                let file_name = input_path.file_name()
+                let file_name = input_path
+                    .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown");
                 let file_stem = file_name.split('.').next().unwrap_or("unknown").to_string();
@@ -1810,8 +1880,10 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                     return Ok((file_stem, sylsp_entries));
                 }
                 // needletail 自动识别 gzip 与 fasta/fastq 格式
-                let mut reader = parse_fastx_file(&input_path)
-                    .context(format!("Failed to open sample file: {}", input_path.display()))?;
+                let mut reader = parse_fastx_file(&input_path).context(format!(
+                    "Failed to open sample file: {}",
+                    input_path.display()
+                ))?;
 
                 // 每条 read 复用的缓冲区，避免 per-read 的 Vec/FxHashSet 分配
                 let mut bufs = TagBufs::default();
@@ -1845,7 +1917,7 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                 Ok((file_stem, sylsp_entries))
             })
             .collect();
-            
+
         // 处理每个样本的结果
         for result in results {
             match result {
@@ -1854,36 +1926,41 @@ pub fn extract(args: ExtractArgs) -> Result<()> {
                     // let fa_path = Path::new(&args.sample_output_dir)
                     //     .join(format!("{}.fasta", file_stem));
                     // let mut fa_writer = create_writer(&fa_path, false)?;
-                    // 
+                    //
                     // for (id, tag) in fa_entries {
                     //     writeln!(fa_writer, ">{}\n{}", id, String::from_utf8_lossy(&tag))
                     //         .context("Failed to write FASTA record")?;
                     // }
-                    // 
+                    //
                     // // 为每个样本生成独立的 sylsp 文件
                     // let sample_sylsp_path = Path::new(&args.sample_output_dir)
                     //     .join(format!("{}.sylsp", file_stem));
                     // let sample_sylsp_file = File::create(&sample_sylsp_path)
                     //     .context(format!("Failed to create sylsp file: {}", sample_sylsp_path.display()))?;
                     // let sample_sylsp_writer = BufWriter::new(sample_sylsp_file);
-                    // 
+                    //
                     // bincode::serialize_into(sample_sylsp_writer, &sylsp_entries)
                     //     .context(format!("Failed to serialize sylsp data for sample: {}", file_stem))?;
-                    
+
                     // 收集所有 sylsp 条目用于合并
                     all_sylsp_entries.extend(sylsp_entries);
-                },
+                }
                 Err(e) => eprintln!("Error processing sample file: {}", e),
             }
         }
-        
+
         // 生成合并的 .sylsp 文件
-        let output_name = args.out_name.as_ref().map_or_else(|| "combined".to_string(), |s| s.clone());
+        let output_name = args
+            .out_name
+            .as_ref()
+            .map_or_else(|| "combined".to_string(), |s| s.clone());
         let sylsp_path = Path::new(&args.sample_output_dir).join(format!("{}.sylsp", output_name));
-        let sylsp_file = File::create(&sylsp_path)
-            .context(format!("Failed to create combined sylsp file: {}", sylsp_path.display()))?;
+        let sylsp_file = File::create(&sylsp_path).context(format!(
+            "Failed to create combined sylsp file: {}",
+            sylsp_path.display()
+        ))?;
         let sylsp_writer = BufWriter::new(sylsp_file);
-        
+
         bincode::serialize_into(sylsp_writer, &all_sylsp_entries)
             .context("Failed to serialize combined sylsp data")?;
     }
@@ -1903,7 +1980,7 @@ fn process_fasta_to_syldb(
     // 注释掉生成单个.fa文件的代码
     // let fa_path = output_base.with_extension("fa");
     // let mut fa_writer = BufWriter::with_capacity(64 * 1024, File::create(&fa_path)?);
-    
+
     let mut stats = ExtractionStats::new();
     // 预分配容量 - 估计每个序列平均产生50个标签
     let mut syldb_entries = Vec::with_capacity(100);
@@ -1965,7 +2042,7 @@ fn process_fasta_to_syldb(
     // let syldb_file = File::create(&syldb_path)
     //     .context(format!("Failed to create syldb file: {}", syldb_path.display()))?;
     // let syldb_writer = BufWriter::with_capacity(64 * 1024, syldb_file);
-    // 
+    //
     // // 使用标准序列化 API
     // bincode::serialize_into(syldb_writer, &syldb_entries)
     //     .context("Failed to serialize syldb data")?;
@@ -1973,8 +2050,6 @@ fn process_fasta_to_syldb(
     log_stats(stats, enzyme);
     Ok(syldb_entries)
 }
-
-
 
 fn process_paired_fastq_to_sylsp(
     input1: &str,
@@ -1986,7 +2061,9 @@ fn process_paired_fastq_to_sylsp(
     let mut stats = ExtractionStats::new();
     let mut entries = Vec::new();
 
-    if get_file_size_optimized(Path::new(input1))? < 2 || get_file_size_optimized(Path::new(input2))? < 2 {
+    if get_file_size_optimized(Path::new(input1))? < 2
+        || get_file_size_optimized(Path::new(input2))? < 2
+    {
         log_stats(stats, enzyme);
         return Ok(entries);
     }
@@ -2026,11 +2103,21 @@ fn process_paired_fastq_to_sylsp(
 
         let id1 = String::from_utf8_lossy(fastq_id(record1.id())).into_owned();
         for (i, (tag, tag_len)) in tags1.iter().enumerate() {
-            entries.push((format!("{}_{}", id1, i + 1), *tag, *tag_len, sample_source.to_string()));
+            entries.push((
+                format!("{}_{}", id1, i + 1),
+                *tag,
+                *tag_len,
+                sample_source.to_string(),
+            ));
         }
         let id2 = String::from_utf8_lossy(fastq_id(record2.id())).into_owned();
         for (i, (tag, tag_len)) in tags2.iter().enumerate() {
-            entries.push((format!("{}_{}", id2, i + 1), *tag, *tag_len, sample_source.to_string()));
+            entries.push((
+                format!("{}_{}", id2, i + 1),
+                *tag,
+                *tag_len,
+                sample_source.to_string(),
+            ));
         }
     }
 
@@ -2046,20 +2133,15 @@ fn calculate_tag_percentage(tag_count: usize, total_kmers: usize) -> f64 {
     }
 }
 
-
-
 fn read_file_list(path: &str) -> Result<Vec<String>> {
-    let file = File::open(path)
-        .context(format!("Failed to open file list: {}", path))?;
+    let file = File::open(path).context(format!("Failed to open file list: {}", path))?;
     let reader = BufReader::new(file);
-    let files: Vec<String> = reader.lines()
-        .filter_map(|line| line.ok())
-        .collect();
+    let files: Vec<String> = reader
+        .lines()
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("Failed to read file list: {}", path))?;
     Ok(files)
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -2141,15 +2223,21 @@ mod tests {
     fn test_process_fasta_to_syldb_tag_seqs_optional() {
         let dir = std::env::temp_dir();
         let fa_path = dir.join("sylph_test_tag_seqs_optional.fa");
-        std::fs::write(&fa_path, ">seq1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n").unwrap();
+        std::fs::write(
+            &fa_path,
+            ">seq1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n",
+        )
+        .unwrap();
         let out_base = dir.join("sylph_test_tag_seqs_optional");
         let enzyme = EnzymeSpec::new("BcgI").unwrap();
 
-        let with_seqs = process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, true).unwrap();
+        let with_seqs =
+            process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, true).unwrap();
         assert_eq!(with_seqs.len(), 1);
         assert!(with_seqs[0].tag_seqs.is_some());
 
-        let without_seqs = process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, false).unwrap();
+        let without_seqs =
+            process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, false).unwrap();
         assert_eq!(without_seqs.len(), 1);
         assert!(without_seqs[0].tag_seqs.is_none());
         // 哈希与长度不受 flag 影响
@@ -2210,10 +2298,20 @@ mod tests {
         let c: f64 = 0.8;
         let a_exact = c.powf(1.0 / 30.0);
         let a_mm = ani_from_containment_one_mismatch(c, 30);
-        assert!(a_mm < a_exact, "a_mm={} should be < a_exact={}", a_mm, a_exact);
+        assert!(
+            a_mm < a_exact,
+            "a_mm={} should be < a_exact={}",
+            a_mm,
+            a_exact
+        );
         // 自检：p_detect_one_mismatch(a_mm, 30) 应接近 c
         let recovered = p_detect_one_mismatch(a_mm, 30);
-        assert!((recovered - c).abs() < 1e-6, "recovered={} != c={}", recovered, c);
+        assert!(
+            (recovered - c).abs() < 1e-6,
+            "recovered={} != c={}",
+            recovered,
+            c
+        );
     }
 
     // ---- 多成员 gzip 回归测试 ----
@@ -2240,14 +2338,24 @@ mod tests {
             }
             s
         };
-        format!("{}CGA{}TGC{}", b4(i, 10), b4(i, 6), b4(i.wrapping_add(12345), 10))
+        format!(
+            "{}CGA{}TGC{}",
+            b4(i, 10),
+            b4(i, 6),
+            b4(i.wrapping_add(12345), 10)
+        )
     }
 
     fn fastq_records(n: usize, offset: usize) -> String {
         let mut s = String::new();
         for i in 0..n {
             let read = bcgi_read(offset + i);
-            s.push_str(&format!("@r{}\n{}\n+\n{}\n", offset + i, read, "~".repeat(read.len())));
+            s.push_str(&format!(
+                "@r{}\n{}\n+\n{}\n",
+                offset + i,
+                read,
+                "~".repeat(read.len())
+            ));
         }
         s
     }
@@ -2322,7 +2430,8 @@ mod tests {
         std::fs::write(&cat_path, &cat_bytes).unwrap();
         let out_base = dir.join("m2b_test_mm_genomes");
 
-        let sketches = process_fasta_to_syldb(&cat_path, &out_base, &enzyme, "fa", false, false).unwrap();
+        let sketches =
+            process_fasta_to_syldb(&cat_path, &out_base, &enzyme, "fa", false, false).unwrap();
         assert_eq!(sketches.len(), 2, "多成员 gzip FASTA 应读出 2 条基因组");
         // 每条基因组至少 20 个 tag（read 拼接处可能偶然形成额外位点，故不取等号）
         assert!(
@@ -2395,14 +2504,11 @@ mod tests {
         for i in 0..3 {
             contig2.push_str(&bcgi_read(100 + i));
         }
-        std::fs::write(
-            &fa_path,
-            format!(">c1\n{}\n>c2\n{}\n", contig1, contig2),
-        )
-        .unwrap();
+        std::fs::write(&fa_path, format!(">c1\n{}\n>c2\n{}\n", contig1, contig2)).unwrap();
         let out_base = dir.join("m2b_test_pos");
         let enzyme = EnzymeSpec::new("BcgI").unwrap();
-        let entries = process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, true).unwrap();
+        let entries =
+            process_fasta_to_syldb(&fa_path, &out_base, &enzyme, "fa", false, true).unwrap();
         assert_eq!(entries.len(), 2);
         for (e, expected_len) in entries.iter().zip([contig1.len(), contig2.len()]) {
             let pos = e.tag_positions.as_ref().expect("v2 应存储位置");

@@ -1,5 +1,5 @@
-use std::arch::x86_64::*;
 use crate::constants::*;
+use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "avx2")]

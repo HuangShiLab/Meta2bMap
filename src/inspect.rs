@@ -25,7 +25,8 @@ struct InspectResult {
     genome_sources: Option<Vec<String>>,
     sample_sources: Option<Vec<SampleStats>>,
     // 每个样本对应的 tag -> 计数
-    per_sample_tag_counts: Option<std::collections::HashMap<String, std::collections::HashMap<Hash, usize>>>,
+    per_sample_tag_counts:
+        Option<std::collections::HashMap<String, std::collections::HashMap<Hash, usize>>>,
     tag_lengths: Vec<usize>,
     tag_length_distribution: Vec<(usize, usize, f64)>,
     patterns: Vec<String>,
@@ -92,21 +93,25 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
                 }
                 writeln!(writer, "Total tags: {}", result.total_tags)?;
                 writeln!(writer, "Unique tags: {}", result.unique_tags)?;
-                
+
                 writeln!(writer, "\nTag Frequency Statistics:")?;
                 writeln!(writer, "------------------------")?;
                 writeln!(writer, "{:<20} {:<10}", "Tag Hash", "Count")?;
                 writeln!(writer, "{:-<30}", "")?;
-                
+
                 // 显示前20个最常见的tag
                 let display_count = std::cmp::min(20, result.tag_frequency_stats.len());
                 for (tag_hash, count) in result.tag_frequency_stats.iter().take(display_count) {
                     writeln!(writer, "{:<20} {:<10}", format!("{:016x}", tag_hash), count)?;
                 }
                 if result.tag_frequency_stats.len() > display_count {
-                    writeln!(writer, "... and {} more unique tags", result.tag_frequency_stats.len() - display_count)?;
+                    writeln!(
+                        writer,
+                        "... and {} more unique tags",
+                        result.tag_frequency_stats.len() - display_count
+                    )?;
                 }
-                
+
                 writeln!(writer, "\nDetected Enzyme Information:")?;
                 writeln!(writer, "-------------------------")?;
                 writeln!(writer, "Enzyme: {}", result.enzyme)?;
@@ -114,12 +119,12 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
                 for (i, pattern) in result.patterns.iter().enumerate() {
                     writeln!(writer, "  {}. {}", i + 1, pattern)?;
                 }
-                
+
                 writeln!(writer, "\nTag Length Distribution:")?;
                 writeln!(writer, "----------------------")?;
                 writeln!(writer, "{:<10} {:<10}", "Length", "Count")?;
                 writeln!(writer, "{:-<20}", "")?;
-                
+
                 for (length, count, _) in &result.tag_length_distribution {
                     writeln!(writer, "{:<10} {:<10}", length, count)?;
                 }
@@ -133,7 +138,11 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
                         writeln!(writer, "  Total tags: {}", sample.total_tags)?;
                         writeln!(writer, "  Tag length distribution:")?;
                         for (length, count, percentage) in &sample.tag_length_distribution {
-                            writeln!(writer, "    Length {}: {} tags ({:.2}%)", length, count, percentage)?;
+                            writeln!(
+                                writer,
+                                "    Length {}: {} tags ({:.2}%)",
+                                length, count, percentage
+                            )?;
                         }
                     }
                 }
@@ -184,19 +193,21 @@ fn inspect_file(file_path: &str) -> Result<InspectResult> {
     match path.extension().and_then(|s| s.to_str()) {
         Some("db") | Some("syldb") => inspect_db(reader, file_path),
         Some("sp") | Some("sylsp") => inspect_sp(reader, file_path),
-        _ => Err(anyhow::anyhow!("Unknown file extension, expected .db/.syldb or .sp/.sylsp")),
+        _ => Err(anyhow::anyhow!(
+            "Unknown file extension, expected .db/.syldb or .sp/.sylsp"
+        )),
     }
 }
 
 fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult> {
-    let entries: Vec<crate::extract::SyldbEntry> = crate::extract::read_syldb(reader)
-        .context("Failed to deserialize .db file")?;
+    let entries: Vec<crate::extract::SyldbEntry> =
+        crate::extract::read_syldb(reader).context("Failed to deserialize .db file")?;
 
     let mut tag_lengths = Vec::new();
     let mut genome_sources = std::collections::HashSet::new();
     let mut genome_stats = std::collections::HashMap::new();
     let mut tag_frequency = std::collections::HashMap::new();
-    
+
     // 检查是否有unique标记信息
     let has_unique_marks = entries.iter().any(|entry| entry.tag_uniqueness.is_some());
     let mut total_unique_tags_marked = 0;
@@ -204,7 +215,7 @@ fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
     for entry in &entries {
         let source = &entry.genome_source;
         genome_sources.insert(source.clone());
-        
+
         let stats = genome_stats.entry(source.clone()).or_insert(GenomeStats {
             source: source.clone(),
             num_records: 0,
@@ -212,15 +223,15 @@ fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
             unique_tags: 0,
             tag_length_distribution: Vec::new(),
         });
-        
+
         stats.num_records += 1;
         stats.total_tags += entry.tags.len();
-        
+
         // 处理tags和uniqueness信息
         for (i, tag) in entry.tags.iter().enumerate() {
             tag_lengths.push(8); // Hash is always 8 bytes (u64)
             *tag_frequency.entry(*tag).or_insert(0) += 1;
-            
+
             // 如果有unique标记，统计unique tags
             if let Some(tag_uniqueness) = &entry.tag_uniqueness {
                 if i < tag_uniqueness.len() && tag_uniqueness[i] {
@@ -247,7 +258,8 @@ fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
     let distribution = calculate_tag_distribution(&tag_lengths);
 
     // 自描述数据库：从条目里读取构建时使用的酶；取众数（理论上所有条目相同）。
-    let enzyme = entries.iter()
+    let enzyme = entries
+        .iter()
         .map(|e| e.enzyme.clone())
         .filter(|e| !e.is_empty())
         .max_by_key(|e| entries.iter().filter(|x| x.enzyme == *e).count())
@@ -263,9 +275,9 @@ fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
     } else {
         tag_frequency.len()
     };
-    
+
     let mut tag_frequency_stats: Vec<(Hash, usize)> = tag_frequency.into_iter().collect();
-    tag_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1)); // 按频率降序排序
+    tag_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count)); // 按频率降序排序
 
     println!("Total tags: {}", tag_lengths.len());
     if has_unique_marks {
@@ -278,7 +290,11 @@ fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
     for (i, pattern) in patterns.iter().enumerate() {
         println!("  {}. {}", i + 1, pattern);
     }
-    println!("Matched tags: {} ({:.2}%)", _matched_count, _matched_ratio * 100.0);
+    println!(
+        "Matched tags: {} ({:.2}%)",
+        _matched_count,
+        _matched_ratio * 100.0
+    );
 
     Ok(InspectResult {
         file_type: "GenomeDatabase".to_string(),
@@ -305,13 +321,16 @@ fn inspect_db(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
 }
 
 fn inspect_sp(reader: BufReader<File>, file_path: &str) -> Result<InspectResult> {
-    let entries: Vec<crate::extract::SylspEntry> = bincode::deserialize_from(reader)
-        .context("Failed to deserialize .sp file")?;
+    let entries: Vec<crate::extract::SylspEntry> =
+        bincode::deserialize_from(reader).context("Failed to deserialize .sp file")?;
 
     let mut tag_lengths = Vec::new();
     let mut sample_stats = std::collections::HashMap::new();
     let mut tag_frequency = std::collections::HashMap::new();
-    let mut per_sample_tag_counts: std::collections::HashMap<String, std::collections::HashMap<Hash, usize>> = std::collections::HashMap::new();
+    let mut per_sample_tag_counts: std::collections::HashMap<
+        String,
+        std::collections::HashMap<Hash, usize>,
+    > = std::collections::HashMap::new();
 
     for entry in &entries {
         tag_lengths.push(8); // Hash is always 8 bytes (u64)
@@ -320,15 +339,17 @@ fn inspect_sp(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
         // 累积每个样本的 tag 计数
         let sample_entry = per_sample_tag_counts
             .entry(entry.sample_source.clone())
-            .or_insert_with(std::collections::HashMap::new);
+            .or_default();
         *sample_entry.entry(entry.tag).or_insert(0) += 1;
 
-        let stats = sample_stats.entry(entry.sample_source.clone()).or_insert(SampleStats {
-            source: entry.sample_source.clone(),
-            num_records: 0,
-            total_tags: 0,
-            tag_length_distribution: Vec::new(),
-        });
+        let stats = sample_stats
+            .entry(entry.sample_source.clone())
+            .or_insert(SampleStats {
+                source: entry.sample_source.clone(),
+                num_records: 0,
+                total_tags: 0,
+                tag_length_distribution: Vec::new(),
+            });
         stats.num_records += 1;
         stats.total_tags += 1;
     }
@@ -352,7 +373,10 @@ fn inspect_sp(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
                 *counts.entry(e.enzyme.as_str()).or_insert(0) += 1;
             }
         }
-        counts.into_iter().max_by_key(|(_, c)| *c).map(|(e, _)| e.to_string())
+        counts
+            .into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(e, _)| e.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     };
     let patterns = Vec::new();
@@ -362,7 +386,7 @@ fn inspect_sp(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
     // 计算tag统计信息
     let unique_tags = tag_frequency.len();
     let mut tag_frequency_stats: Vec<(Hash, usize)> = tag_frequency.into_iter().collect();
-    tag_frequency_stats.sort_by(|a, b| b.1.cmp(&a.1)); // 按频率降序排序
+    tag_frequency_stats.sort_by_key(|&(_, count)| std::cmp::Reverse(count)); // 按频率降序排序
 
     Ok(InspectResult {
         file_type: "SampleProfile".to_string(),
@@ -413,7 +437,7 @@ fn inspect_sp(reader: BufReader<File>, file_path: &str) -> Result<InspectResult>
 
 fn calculate_tag_distribution(tag_lengths: &[usize]) -> Vec<(usize, usize, f64)> {
     use std::collections::HashMap;
-    
+
     let mut length_counts: HashMap<usize, usize> = HashMap::new();
     for &length in tag_lengths {
         *length_counts.entry(length).or_insert(0) += 1;
@@ -458,11 +482,11 @@ fn collect_tag_matrix_data(result: &InspectResult, tag_matrix: &mut TagMatrix) {
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            
+
             if !tag_matrix.samples.contains(&sample_name) {
                 tag_matrix.samples.push(sample_name.clone());
             }
-            
+
             // 收集该数据库中的所有标签
             for (tag_hash, count) in &result.tag_frequency_stats {
                 if !tag_matrix.tags.contains(tag_hash) {
@@ -480,24 +504,24 @@ fn collect_tag_matrix_data(result: &InspectResult, tag_matrix: &mut TagMatrix) {
 fn generate_tsv_matrix(tag_matrix: &TagMatrix, log_path: &str, tsv_name: &str) -> Result<()> {
     // 确保输出目录存在
     std::fs::create_dir_all(log_path)?;
-    
+
     // 构建完整的文件路径
     let tsv_path = Path::new(log_path).join(tsv_name);
     let mut tsv_writer = BufWriter::new(File::create(&tsv_path)?);
-    
+
     // 排序样本和标签以确保输出的一致性
     let mut sorted_samples = tag_matrix.samples.clone();
     sorted_samples.sort();
     let mut sorted_tags = tag_matrix.tags.clone();
     sorted_tags.sort();
-    
+
     // 写入表头
     write!(tsv_writer, "Tag")?; // 目前保存的是哈希，无法还原原始序列，这里用16进制hash展示
     for sample in &sorted_samples {
         write!(tsv_writer, "\t{}", sample)?;
     }
     writeln!(tsv_writer)?;
-    
+
     // 写入数据行
     for tag in &sorted_tags {
         write!(tsv_writer, "{:016x}", tag)?;
@@ -507,7 +531,7 @@ fn generate_tsv_matrix(tag_matrix: &TagMatrix, log_path: &str, tsv_name: &str) -
         }
         writeln!(tsv_writer)?;
     }
-    
+
     println!("Tag count matrix saved to: {}", tsv_path.display());
     Ok(())
 }

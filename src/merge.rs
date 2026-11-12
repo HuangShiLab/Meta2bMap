@@ -48,11 +48,7 @@ pub fn merge(args: MergeArgs) -> Result<()> {
             }
         }
 
-        eprintln!(
-            "{}: {} entries",
-            path.display(),
-            entries.len()
-        );
+        eprintln!("{}: {} entries", path.display(), entries.len());
         all_entries.extend(entries);
     }
 
@@ -121,11 +117,16 @@ mod tests {
         let p2 = dir.join("m2b_merge_test_b.syldb");
         let pout = dir.join("m2b_merge_test_out.syldb");
 
-        let entries_a = vec![make_entry("g1", "BcgI", true), make_entry("g2", "BcgI", true)];
+        let entries_a = vec![
+            make_entry("g1", "BcgI", true),
+            make_entry("g2", "BcgI", true),
+        ];
         let entries_b = vec![make_entry("g3", "BcgI", false)];
 
-        crate::extract::write_syldb(BufWriter::new(File::create(&p1).unwrap()), &entries_a).unwrap();
-        crate::extract::write_syldb(BufWriter::new(File::create(&p2).unwrap()), &entries_b).unwrap();
+        crate::extract::write_syldb(BufWriter::new(File::create(&p1).unwrap()), &entries_a)
+            .unwrap();
+        crate::extract::write_syldb(BufWriter::new(File::create(&p2).unwrap()), &entries_b)
+            .unwrap();
 
         let args = MergeArgs {
             inputs: vec![
@@ -160,12 +161,12 @@ mod tests {
 
         crate::extract::write_syldb(
             BufWriter::new(File::create(&p1).unwrap()),
-            &vec![make_entry("g1", "BcgI", true)],
+            &[make_entry("g1", "BcgI", true)],
         )
         .unwrap();
         crate::extract::write_syldb(
             BufWriter::new(File::create(&p2).unwrap()),
-            &vec![make_entry("g2", "BslFI", true)],
+            &[make_entry("g2", "BslFI", true)],
         )
         .unwrap();
 

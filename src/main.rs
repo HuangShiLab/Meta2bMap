@@ -1,43 +1,24 @@
-// src/inspect.rs
-
-//Use this allocator when statically compiling
-//instead of the default
-//because the musl statically compiled binary
-//uses a bad default allocator which makes the
-//binary take 60% longer!!! Only affects
-//static compilation though. #[cfg(target_env = "musl")]
+//! Meta2bMap command-line entry point.
 
 use anyhow::Result;
 use clap::Parser;
+use meta2bmap::{contain, extract, inspect, mark, merge, sketch, view, Mode};
 use tikv_jemallocator::Jemalloc;
 
-mod cmdline;
-mod extract;
-mod sketch;
-mod contain;
-mod constants;
-mod inspect;
-mod view;
-mod mark;
-mod merge;
-
-#[cfg(target_arch = "x86_64")]
-mod avx2_seeding;
-
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc; //use std::panic::set_hook;
+static GLOBAL: Jemalloc = Jemalloc;
 
 fn main() -> Result<()> {
-    let cli = cmdline::Cli::parse();
+    let cli = meta2bmap::Cli::parse();
 
     match cli.mode {
-        cmdline::Mode::Extract(extract_args) => extract::extract(extract_args),
-        cmdline::Mode::Sketch(sketch_args) => sketch::sketch(sketch_args),
-        cmdline::Mode::Inspect(inspect_args) => inspect::inspect(inspect_args),
-        cmdline::Mode::View(view_args) => view::view(view_args),
-        cmdline::Mode::Query(contain_args) => contain::query(contain_args),
-        cmdline::Mode::Profile(profile_args) => contain::profile(profile_args),
-        cmdline::Mode::Mark(mark_args) => mark::mark(mark_args),
-        cmdline::Mode::Merge(merge_args) => merge::merge(merge_args)
+        Mode::Extract(args) => extract::extract(args),
+        Mode::Sketch(args) => sketch::sketch(args),
+        Mode::Inspect(args) => inspect::inspect(args),
+        Mode::View(args) => view::view(args),
+        Mode::Query(args) => contain::query(args),
+        Mode::Profile(args) => contain::profile(args),
+        Mode::Mark(args) => mark::mark(args),
+        Mode::Merge(args) => merge::merge(args),
     }
 }
