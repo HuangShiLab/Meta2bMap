@@ -6,9 +6,9 @@
 
 Meta2bMap is a Rust command-line tool that profiles metagenomic samples by matching
 restriction-enzyme (2bRAD) tags extracted from sequencing reads against tags extracted
-from reference genomes. It reports per-genome containment ANI with a coverage-adjustment
-model (a negative-binomial per-locus model that corrects the naive containment ANI at low
-coverage), together with taxonomic and sequence abundances.
+from reference genomes. It reports per-genome containment ANI with coverage adjustment
+(a Poisson ratio estimator that corrects naive containment at low coverage), together
+with taxonomic and sequence abundances.
 
 It works on two kinds of data:
 
